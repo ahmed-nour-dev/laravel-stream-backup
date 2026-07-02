@@ -285,7 +285,7 @@ php -r "echo base64_encode(random_bytes(32));"
 | `retention.weekly` | 4 | Weekly (non-last-Sunday) backups kept |
 | `retention.monthly` | 6 | Monthly (last Sunday of month) backups kept |
 | `queue.max_concurrent` | 2 | Atomic semaphore cap across all workers |
-| `queue.slot_ttl` | 21 600 s | Semaphore lease (6 h) |
+| `queue.slot_ttl` | 21 600 s | Per-slot lease; a crashed worker's slot auto-expires (6 h) |
 | `verify_after_upload` | `true` | Validates object size + gzip magic bytes after completion |
 | `auto_schedule` | `true` | Auto-register cleanup/stale-abort on Laravel scheduler |
 | `schedule.cleanup.frequency` | `daily` | Cleanup job cadence |

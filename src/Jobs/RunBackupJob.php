@@ -22,6 +22,7 @@ use Ahmednour\StreamBackup\Support\PreflightChecker;
 use Ahmednour\StreamBackup\Support\RetentionClassifier;
 use Carbon\CarbonImmutable;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Config\Repository as Config;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -71,39 +72,48 @@ class RunBackupJob implements ShouldQueue
             });
         }
 
-        if (! $semaphore->acquire()) {
+        try {
+            $token = $semaphore->acquire();
+        } catch (LockTimeoutException $e) {
+            // Mutex contention — re-queue gracefully instead of burning a retry.
+            static::dispatch($this->context)->delay(now()->addMinutes(5));
+            return;
+        }
+
+        if ($token === null) {
             // All slots busy — re-queue with a delay so we don't hammer Redis.
             static::dispatch($this->context)->delay(now()->addMinutes(5));
             return;
         }
 
-        $startedAt  = CarbonImmutable::now();
-        $dumper     = $dumperFactory->make($this->context->driver);
-        $encryption = $encryptionFactory->make();
-        $backup = Backup::create([
-            'tenant_id'          => $this->context->tenantId,
-            'database_name'      => $this->context->databaseName,
-            'connection_name'    => $this->context->connectionName,
-            'disk'               => $this->context->disk,
-            'status'             => BackupStatus::Pending->value,
-            'compression_driver' => $compression->name(),
-            'dump_driver'        => $dumper->name(),
-            'encryption_driver'  => $encryption->name() !== 'none' ? $encryption->name() : null,
-            'started_at'         => $startedAt,
-        ]);
-
-        BackupStarting::dispatch($this->context, $backup);
-        $preflightChecker->check();
-
-        $extension = $encryption->name() !== 'none' ? 'sql.gz.enc' : 'sql.gz';
-        $path      = $pathBuilder->build($this->context, $startedAt, $extension);
-        $backup->forceFill([
-            'path'           => $path,
-            'retention_tier' => $classifier->classify($startedAt)->value,
-        ])->save();
-        $backup->markAs(BackupStatus::Dumping);
-
+        $backup = null;
         try {
+            $startedAt  = CarbonImmutable::now();
+            $dumper     = $dumperFactory->make($this->context->driver);
+            $encryption = $encryptionFactory->make();
+            $backup = Backup::create([
+                'tenant_id'          => $this->context->tenantId,
+                'database_name'      => $this->context->databaseName,
+                'connection_name'    => $this->context->connectionName,
+                'disk'               => $this->context->disk,
+                'status'             => BackupStatus::Pending->value,
+                'compression_driver' => $compression->name(),
+                'dump_driver'        => $dumper->name(),
+                'encryption_driver'  => $encryption->name() !== 'none' ? $encryption->name() : null,
+                'started_at'         => $startedAt,
+            ]);
+
+            BackupStarting::dispatch($this->context, $backup);
+            $preflightChecker->check();
+
+            $extension = $encryption->name() !== 'none' ? 'sql.gz.enc' : 'sql.gz';
+            $path      = $pathBuilder->build($this->context, $startedAt, $extension);
+            $backup->forceFill([
+                'path'           => $path,
+                'retention_tier' => $classifier->classify($startedAt)->value,
+            ])->save();
+            $backup->markAs(BackupStatus::Dumping);
+
             $bucket = (string) ($config->get("filesystems.disks.{$this->context->disk}.bucket")
                 ?? $this->context->disk);
 
@@ -145,18 +155,19 @@ class RunBackupJob implements ShouldQueue
 
             BackupSuccessful::dispatch($this->context, $backup);
         } catch (\Throwable $e) {
-
-            try {
-                $backup->markAs($aborted ? BackupStatus::Aborted : BackupStatus::Failed, [
-                    'error_message' => $e->getMessage(),
-                    'finished_at'   => now(),
-                ]);
-            } catch (\Throwable) {
-                $backup->forceFill([
-                    'status'        => ($aborted ? BackupStatus::Aborted : BackupStatus::Failed)->value,
-                    'error_message' => $e->getMessage(),
-                    'finished_at'   => now(),
-                ])->save();
+            if ($backup !== null) {
+                try {
+                    $backup->markAs($aborted ? BackupStatus::Aborted : BackupStatus::Failed, [
+                        'error_message' => $e->getMessage(),
+                        'finished_at'   => now(),
+                    ]);
+                } catch (\Throwable) {
+                    $backup->forceFill([
+                        'status'        => ($aborted ? BackupStatus::Aborted : BackupStatus::Failed)->value,
+                        'error_message' => $e->getMessage(),
+                        'finished_at'   => now(),
+                    ])->save();
+                }
             }
 
             if (! $aborted) {
@@ -165,7 +176,7 @@ class RunBackupJob implements ShouldQueue
 
             throw $e;
         } finally {
-            $semaphore->release();
+            $semaphore->release($token);
         }
     }
 }
