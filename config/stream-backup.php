@@ -154,7 +154,10 @@ return [
     |
     | max_concurrent caps the number of backup jobs that may run at the same
     | time across all workers; additional jobs re-queue with delay.
-    | slot_ttl is the semaphore lease duration (seconds).
+    | slot_ttl is the per-slot lease (seconds): a slot held by a worker that
+    | crashes (SIGKILL/OOM) before reaching release() auto-expires after this
+    | duration, so the next acquire() reclaims it. (The internal mutex guarding
+    | the slot map uses a separate, tiny TTL and is unrelated to this value.)
     |
     */
     'queue' => [
@@ -266,6 +269,25 @@ return [
         'strip_definers'        => env('STREAM_BACKUP_RESTORE_STRIP_DEFINERS', true),
         'skip_on_error'         => env('STREAM_BACKUP_RESTORE_SKIP_ON_ERROR', true),
         'skippable_error_codes' => [1227],
+
+        // Atomic restore via rename-aside "shadow" tables. Each existing
+        // table is renamed to `_sbr_*` before its dump block runs; the dump's
+        // DROP/CREATE/INSERT then execute against the real name. On failure
+        // the originals are renamed back (true cross-table rollback for the
+        // DDL path, which a DB transaction cannot provide). On a clean
+        // success the superseded originals are dropped; on a known-incomplete
+        // success (skip_on_error swallowed statements) the shadows are
+        // retained for manual recovery.
+        //
+        // Caveats:
+        //  - Visibility is per-table, not a single atomic swap: live traffic
+        //    can see a half-old/half-new database during a long restore.
+        //  - For a SELECTIVE restore of an FK PARENT of a table NOT in the
+        //    restore, the rename repoints the unrestored child's FK to the
+        //    shadow, which is dropped on success → orphaned FK metadata.
+        //    Full-schema restores are safe.
+        // Set false to disable (e.g. read-replica restores).
+        'atomic_restore'        => env('STREAM_BACKUP_RESTORE_ATOMIC_RESTORE', true),
 
         // Tables excluded from restore to prevent the process from
         // destroying its own tracking records. A full restore replays

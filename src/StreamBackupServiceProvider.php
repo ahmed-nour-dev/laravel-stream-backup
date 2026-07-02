@@ -72,9 +72,9 @@ class StreamBackupServiceProvider extends ServiceProvider
         $this->app->singleton(BackupSemaphore::class, function ($app) {
             $config = $app->make(Config::class);
             return new BackupSemaphore(
-                cache:          $app->make(CacheRepository::class),
-                maxConcurrent:  (int) $config->get('stream-backup.queue.max_concurrent', 2),
-                lockTtl:        (int) $config->get('stream-backup.queue.slot_ttl', 21600),
+                cache:         $app->make(CacheRepository::class),
+                maxConcurrent: (int) $config->get('stream-backup.queue.max_concurrent', 2),
+                slotTtl:       (int) $config->get('stream-backup.queue.slot_ttl', 21600),
             );
         });
 

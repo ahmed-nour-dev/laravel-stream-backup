@@ -1,7 +1,7 @@
 {
     "name": "ahmednour1430464/laravel-stream-backup",
     "description": "Streaming database backup for Laravel: dump → compress → S3 multipart upload with constant memory use. Supports MySQL, PostgreSQL, SQLite, and custom drivers.",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "type": "library",
     "license": "MIT",
     "keywords": [
