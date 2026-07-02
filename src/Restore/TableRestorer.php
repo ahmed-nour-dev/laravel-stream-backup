@@ -39,14 +39,26 @@ use Illuminate\Support\Facades\Log;
  * mechanism; restore against a database with no live traffic if you need
  * snapshot visibility.
  *
- * FK CAVEAT
- * ---------
+ * FK CAVEAT + DEPENDENCY ORDERING
+ * -------------------------------
  * InnoDB auto-updates a child table's FK metadata to follow a RENAME TABLE of
- * the parent. For a SELECTIVE restore of a table that is an FK parent of a
- * table NOT included in the restore, the rename repoints the unrestored
- * child's FK to `_sbr_*`, which is dropped on success → orphaned FK metadata.
- * Full-schema restores are safe (every child is recreated referencing fresh
- * parents). Disable `restore.atomic_restore` to opt out of shadow tables.
+ * the parent. The shadow-table mechanism is only safe if every FK PARENT is
+ * renamed-aside + recreated BEFORE any child that references it: otherwise
+ * the parent's later rename repoints the already-created child's fresh FK to
+ * the `_sbr_*` shadow, which is dropped at the end → permanently orphaned FK
+ * metadata.
+ *
+ * mysqldump emits tables alphabetically, which does NOT match FK-dependency
+ * order in general (child tables often sort before their parents). So before
+ * the restore loop the table blocks are topologically sorted parents-first,
+ * driven by the existing schema's information_schema.referential_constraints,
+ * with dump order preserved for tables with no FK relationship. This makes
+ * full-schema restores safe regardless of mysqldump's alphabetical ordering.
+ *
+ * Remaining caveat: a SELECTIVE restore of a table that is an FK parent of a
+ * table NOT included in the restore still repoints the unrestored child's FK
+ * to `_sbr_*`, which is dropped on success → orphaned FK metadata. Disable
+ * `restore.atomic_restore` to opt out of shadow tables entirely.
  *
  * SKIP-ON-ERROR INTERACTION
  * -------------------------
@@ -59,12 +71,14 @@ use Illuminate\Support\Facades\Log;
  *   1. Fail fast if any stale `_sbr_*` shadows exist (a previous crashed
  *      restore) — never silently destroy what could be an original.
  *   2. Disable FK checks (SET FOREIGN_KEY_CHECKS = 0).
- *   3. For each table: rename original aside (if atomic_restore + exists),
- *      then execute its dump block via executeBuffer().
- *   4. On clean success: drop the renamed-aside originals.
+ *   3. Reorder the table blocks parents-first (FK dependency sort) so every
+ *      FK parent is renamed-aside + recreated before any child referencing it.
+ *   4. For each table (in dependency order): rename original aside (if
+ *      atomic_restore + exists), then execute its dump block via executeBuffer().
+ *   5. On clean success: drop the renamed-aside originals.
  *      On incomplete success (skipped > 0): retain shadows + warn.
- *   5. On any Throwable: rollbackShadows(), then re-throw.
- *   6. finally: re-enable FK checks + close buffers.
+ *   6. On any Throwable: rollbackShadows(), then re-throw.
+ *   7. finally: re-enable FK checks + close buffers.
  */
 final class TableRestorer
 {
@@ -136,6 +150,13 @@ final class TableRestorer
 
             $this->execSql($db, 'SET FOREIGN_KEY_CHECKS = 0');
             Log::info('[Restore] Disabled foreign key checks.');
+
+            // Restore FK parents before children: mysqldump emits tables
+            // alphabetically, which does not match FK-dependency order. If a
+            // child is recreated before its parent is renamed aside, the
+            // parent's later rename repoints the child's fresh FK to the
+            // _sbr_* shadow (dropped at the end) → orphaned FK metadata.
+            $tableBlocks = $this->orderTablesByDependency($db, $tableBlocks);
 
             foreach ($tableBlocks as $tableName => $buffer) {
                 $currentTable = $tableName;
@@ -511,5 +532,146 @@ final class TableRestorer
             . '). Resolve them manually (rename back to restore originals, or drop '
             . 'if disposable) before starting a new restore.'
         );
+    }
+
+    /**
+     * Order the table blocks so that every FK parent is restored (renamed
+     * aside + recreated) before any child that references it. See the class
+     * docblock's "FK CAVEAT + DEPENDENCY ORDERING" section for why this is
+     * required for correctness — mysqldump's alphabetical order does not
+     * match FK-dependency order in general.
+     *
+     * The graph is read from the EXISTING schema's
+     * information_schema.referential_constraints, so it is exact for a full
+     * restore into a schema that matches the dump. Tables not present in the
+     * existing schema (or with no FK relationship) keep their dump order.
+     *
+     * @param array<string, resource> $tableBlocks
+     * @return array<string, resource>
+     */
+    private function orderTablesByDependency(ConnectionInterface $db, array $tableBlocks): array
+    {
+        $tables = array_values(array_keys($tableBlocks));
+
+        if (count($tables) < 2) {
+            return $tableBlocks;
+        }
+
+        $ordered = self::orderTables($tables, $this->fkEdges($db, $tables));
+
+        $result = [];
+        foreach ($ordered as $table) {
+            if (isset($tableBlocks[$table])) {
+                $result[$table] = $tableBlocks[$table];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * FK parent→child edges among the tables being restored, as they exist in
+     * the target schema right now. Only edges whose BOTH endpoints are in the
+     * restore set are returned — a parent outside the set is never renamed
+     * aside, so it cannot trigger the rename-follows-FK repointing this
+     * ordering exists to prevent.
+     *
+     * @param string[] $tables
+     * @return array<int, array{0: string, 1: string}> list of [parent, child]
+     */
+    private function fkEdges(ConnectionInterface $db, array $tables): array
+    {
+        if ($tables === []) {
+            return [];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($tables), '?'));
+
+        $rows = $db->select(
+            'SELECT referenced_table_name AS parent, table_name AS child '
+            . 'FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() '
+            . "AND referenced_table_name IN ({$placeholders}) "
+            . "AND table_name IN ({$placeholders})",
+            array_merge($tables, $tables),
+            false,
+        );
+
+        $edges = [];
+        foreach ($rows as $row) {
+            $parent = is_object($row) && isset($row->parent) ? (string) $row->parent : '';
+            $child  = is_object($row) && isset($row->child) ? (string) $row->child : '';
+
+            if ($parent !== '' && $child !== '') {
+                $edges[] = [$parent, $child];
+            }
+        }
+
+        return $edges;
+    }
+
+    /**
+     * Stable topological sort: parents before children. Pure (no DB), so it is
+     * directly unit-testable. Edges are [parent, child] pairs — a child's FK
+     * references a parent, so the parent must be restored first. Tables not
+     * involved in any edge keep their original order; a cycle (mutual FK)
+     * falls back to insertion order rather than deadlocking.
+     *
+     * @param string[]                                           $tables Ordered table names (dump order).
+     * @param array<int, array{0: string, 1: string}> $edges  [parent, child] pairs.
+     * @return string[] Tables ordered parents-first, stable on dump order.
+     */
+    public static function orderTables(array $tables, array $edges): array
+    {
+        if (count($tables) < 2) {
+            return $tables;
+        }
+
+        /** @var array<string, array<string, true>> $parentsOf child => [parent => true] */
+        $parentsOf = [];
+        foreach ($edges as [$parent, $child]) {
+            if ($parent === $child) {
+                continue; // self-reference imposes no ordering.
+            }
+            $parentsOf[$child][$parent] = true;
+        }
+
+        $emitted   = [];
+        $ordered    = [];
+        $remaining = array_values($tables);
+
+        while ($remaining !== []) {
+            $progress = false;
+            foreach ($remaining as $i => $table) {
+                $ready = true;
+                foreach (array_keys($parentsOf[$table] ?? []) as $parent) {
+                    if (! isset($emitted[$parent])) {
+                        $ready = false;
+                        break;
+                    }
+                }
+
+                if ($ready) {
+                    $ordered[] = $table;
+                    $emitted[$table] = true;
+                    unset($remaining[$i]);
+                    $progress = true;
+                }
+            }
+
+            $remaining = array_values($remaining);
+
+            if (! $progress) {
+                // No table is ready (mutual-FK cycle, or a parent missing
+                // from the restore set that fkEdges should have filtered).
+                // Emit the rest in dump order rather than deadlocking.
+                foreach ($remaining as $table) {
+                    $ordered[] = $table;
+                }
+                break;
+            }
+        }
+
+        return $ordered;
     }
 }

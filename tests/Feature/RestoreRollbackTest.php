@@ -32,8 +32,8 @@ final class RestoreRollbackTest extends TestCase
 {
     /** @var array<int, string> tables + their shadow names to drop between/after runs */
     private const CLEANUP_TABLES = [
-        'orders', 'customers', 'widgets',
-        '_sbr_orders', '_sbr_customers', '_sbr_widgets',
+        'orders', 'customers', 'widgets', 'accessories',
+        '_sbr_orders', '_sbr_customers', '_sbr_widgets', '_sbr_accessories',
     ];
 
     /**
@@ -261,6 +261,129 @@ final class RestoreRollbackTest extends TestCase
         $shadow = $db->selectOne('SELECT `sku` FROM `_sbr_widgets` WHERE `id` = 1');
         self::assertNotNull($shadow, 'Shadow table _sbr_widgets must be retained when statements were skipped.');
         self::assertSame('ORIGINAL-SKU', $shadow->sku);
+    }
+
+    public function test_case_c_child_sorting_before_parent_keeps_fk_intact_on_clean_restore(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        // 'accessories' (child) sorts alphabetically BEFORE 'widgets'
+        // (parent) — exactly mysqldump's default ordering, and exactly the
+        // case Case A's customers/orders names accidentally avoid. Without
+        // dependency ordering the child is recreated before the parent is
+        // renamed aside; the parent's later rename then repoints the child's
+        // fresh FK to _sbr_widgets, which dropShadows() drops at the end →
+        // permanently orphaned FK metadata on a supposedly "clean" full restore.
+        $db->unprepared('CREATE TABLE `widgets` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->unprepared('CREATE TABLE `accessories` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `widget_id` INT UNSIGNED NOT NULL,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`),
+            CONSTRAINT `fk_accessories_widget` FOREIGN KEY (`widget_id`) REFERENCES `widgets` (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->insert('INSERT INTO `widgets` (`id`, `name`) VALUES (?, ?)', [1, 'original-widget']);
+        $db->insert('INSERT INTO `accessories` (`id`, `widget_id`, `name`) VALUES (?, ?, ?)', [1, 1, 'original-accessory']);
+
+        // Dump order is alphabetical (mysqldump default): accessories before widgets.
+        $accessoriesBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `accessories`;\n"
+            . "CREATE TABLE `accessories` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `widget_id` INT UNSIGNED NOT NULL,\n"
+            . "  `name` VARCHAR(100) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`),\n"
+            . "  CONSTRAINT `fk_accessories_widget` FOREIGN KEY (`widget_id`) REFERENCES `widgets` (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `accessories` (`id`, `widget_id`, `name`) VALUES (1, 1, 'restored-accessory');\n"
+        );
+
+        $widgetsBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `widgets`;\n"
+            . "CREATE TABLE `widgets` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `name` VARCHAR(100) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `widgets` (`id`, `name`) VALUES (1, 'restored-widget');\n"
+        );
+
+        // Alphabetical (mysqldump) order — the ordering that exposes the bug.
+        $tableBlocks = [
+            'accessories' => $accessoriesBlock,
+            'widgets'     => $widgetsBlock,
+        ];
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        $result = $restorer->restore($tableBlocks, 'mysql_test', microtime(true));
+
+        // The dependency sort must have reordered parent-before-child.
+        self::assertSame(['widgets', 'accessories'], $result->tablesRestored,
+            'Restore must process the FK parent (widgets) before the child (accessories).');
+
+        // Data restored.
+        $widget = $db->selectOne('SELECT `name` FROM `widgets` WHERE `id` = 1');
+        self::assertNotNull($widget);
+        self::assertSame('restored-widget', $widget->name);
+
+        $accessory = $db->selectOne('SELECT `name` FROM `accessories` WHERE `id` = 1');
+        self::assertNotNull($accessory);
+        self::assertSame('restored-accessory', $accessory->name);
+
+        // No leftover shadow tables (clean restore drops them).
+        $shadows = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.tables '
+            . 'WHERE table_schema = DATABASE() AND table_name LIKE CONCAT(?, ?, ?)',
+            ['_', 'sbr_', '%']
+        );
+        self::assertNotNull($shadows);
+        self::assertSame(0, (int) $shadows->n);
+
+        // THE key assertion: accessories' FK must resolve to `widgets` (the
+        // fresh parent), NOT to a dropped _sbr_widgets shadow. Without the
+        // dependency-ordering fix this would be 0 (dangling on _sbr_widgets).
+        $fk = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() '
+            . 'AND table_name = ? AND referenced_table_name = ?',
+            ['accessories', 'widgets']
+        );
+        self::assertNotNull($fk);
+        self::assertSame(1, (int) $fk->n, 'FK on accessories must resolve to widgets (not a dropped _sbr_* shadow) after a clean restore.');
+
+        // And no FK may reference a leftover _sbr_* shadow name.
+        $dangling = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() AND referenced_table_name LIKE CONCAT(?, ?, ?)',
+            ['_', 'sbr_', '%']
+        );
+        self::assertNotNull($dangling);
+        self::assertSame(0, (int) $dangling->n, 'No FK may reference a _sbr_* shadow name after a clean restore.');
+
+        // Live FK enforcement: a dangling widget_id insert must be rejected
+        // (proves the FK is enforced against the real widgets, not just
+        // present as metadata).
+        $db->unprepared('SET FOREIGN_KEY_CHECKS = 1');
+        $enforced = false;
+        try {
+            $db->insert(
+                'INSERT INTO `accessories` (`widget_id`, `name`) VALUES (?, ?)',
+                [999999, 'fk-probe']
+            );
+        } catch (\Throwable) {
+            $enforced = true;
+        }
+        self::assertTrue($enforced, 'FK on accessories must be enforced (reject a dangling widget_id) after a clean restore.');
     }
 
     // ------------------------------------------------------------------
