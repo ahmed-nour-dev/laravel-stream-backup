@@ -60,6 +60,15 @@ use Illuminate\Support\Facades\Log;
  * to `_sbr_*`, which is dropped on success → orphaned FK metadata. Disable
  * `restore.atomic_restore` to opt out of shadow tables entirely.
  *
+ * Residual gap (smaller): the dependency sort reads FK edges from
+ * information_schema (the EXISTING schema), so a brand-new child table ADDED
+ * by this restore run that references a pre-existing parent has no constraint
+ * row yet and its edge won't be captured — the same failure mode can resurface
+ * in the narrow case of adding a new FK-child table in the same run as
+ * replacing its parent. Parsing FK declarations out of the dump's own
+ * CREATE TABLE buffers (which TableRestorer already holds) would close it;
+ * tracked as a follow-up ticket.
+ *
  * SKIP-ON-ERROR INTERACTION
  * -------------------------
  * When `skip_on_error` swallows statements (`skippedCount > 0`) the restore is
