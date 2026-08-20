@@ -1,9 +1,9 @@
 # laravel-stream-backup
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/ahmednour1430464/laravel-stream-backup.svg?style=flat-square)](https://packagist.org/packages/ahmednour1430464/laravel-stream-backup)
-[![Total Downloads](https://img.shields.io/packagist/dt/ahmednour1430464/laravel-stream-backup.svg?style=flat-square)](https://packagist.org/packages/ahmednour1430464/laravel-stream-backup)
-[![License](https://img.shields.io/packagist/l/ahmednour1430464/laravel-stream-backup.svg?style=flat-square)](https://github.com/ahmednour1430464/laravel-stream-backup/blob/main/LICENSE.md)
-[![GitHub Tests Action Status](https://img.shields.io/github/actions/workflow/status/ahmednour1430464/laravel-stream-backup/tests.yml?branch=main&label=tests&style=flat-square)](https://github.com/ahmednour1430464/laravel-stream-backup/actions?query=workflow%3Atests+branch%3Amain)
+[![Latest Version on Packagist](https://img.shields.io/packagist/v/ahmednour/laravel-stream-backup.svg?style=flat-square)](https://packagist.org/packages/ahmednour/laravel-stream-backup)
+[![Total Downloads](https://img.shields.io/packagist/dt/ahmednour/laravel-stream-backup.svg?style=flat-square)](https://packagist.org/packages/ahmednour/laravel-stream-backup)
+[![License](https://img.shields.io/packagist/l/ahmednour/laravel-stream-backup.svg?style=flat-square)](https://github.com/ahmed-nour-dev/laravel-stream-backup/blob/main/LICENSE.md)
+[![GitHub Tests Action Status](https://img.shields.io/github/actions/workflow/status/ahmed-nour-dev/laravel-stream-backup/tests.yml?branch=main&label=tests&style=flat-square)](https://github.com/ahmed-nour-dev/laravel-stream-backup/actions?query=workflow%3Atests+branch%3Amain)
 
 > Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → transaction restores for Laravel 10+, with **constant memory use** regardless of database size.
 
@@ -49,10 +49,10 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 
 | Package | PHP | Laravel | Testbench | PHPUnit |
 |---|---|---|---|---|
-| `ahmednour1430464/laravel-stream-backup` | `8.1 / 8.2 / 8.3 / 8.4` | `10.*` | `8.*` | `10.*` |
-| `ahmednour1430464/laravel-stream-backup` | `8.2 / 8.3 / 8.4` | `11.*` | `9.*` | `10.* / 11.*` |
-| `ahmednour1430464/laravel-stream-backup` | `8.2 / 8.3 / 8.4` | `12.*` | `10.*` | `11.* / 12.*` |
-| `ahmednour1430464/laravel-stream-backup` | `8.3 / 8.4` | `13.*` | `11.*` | `11.* / 12.*` |
+| `ahmednour/laravel-stream-backup` | `8.1 / 8.2 / 8.3 / 8.4` | `10.*` | `8.*` | `10.*` |
+| `ahmednour/laravel-stream-backup` | `8.2 / 8.3 / 8.4` | `11.*` | `9.*` | `10.* / 11.*` |
+| `ahmednour/laravel-stream-backup` | `8.2 / 8.3 / 8.4` | `12.*` | `10.*` | `11.* / 12.*` |
+| `ahmednour/laravel-stream-backup` | `8.3 / 8.4` | `13.*` | `11.*` | `11.* / 12.*` |
 
 ## Supported Databases
 
@@ -74,7 +74,7 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 ## Installation
 
 ```bash
-composer require ahmednour1430464/laravel-stream-backup
+composer require ahmednour/laravel-stream-backup
 php artisan vendor:publish --tag=stream-backup
 php artisan migrate
 ```

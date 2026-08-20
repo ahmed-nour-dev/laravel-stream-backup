@@ -1,7 +1,6 @@
 {
-    "name": "ahmednour1430464/laravel-stream-backup",
+    "name": "ahmednour/laravel-stream-backup",
     "description": "Streaming database backup for Laravel: dump → compress → S3 multipart upload with constant memory use. Supports MySQL, PostgreSQL, SQLite, and custom drivers.",
-    "version": "1.4.1",
     "type": "library",
     "license": "MIT",
     "keywords": [
@@ -18,10 +17,12 @@
         "pigz",
         "multi-driver"
     ],
+    "homepage": "https://github.com/ahmed-nour-dev/laravel-stream-backup",
     "authors": [
         {
-            "name": "ahmednour",
-            "email": "ahmednour1430464@gmail.com"
+            "name": "Ahmed Nour",
+            "homepage": "https://github.com/ahmed-nour-dev",
+            "role": "Developer"
         }
     ],
     "require": {
