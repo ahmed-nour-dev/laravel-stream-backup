@@ -35,8 +35,11 @@ use Illuminate\Support\Facades\Log;
  *    while decompressed SQL is read from stdout — same pattern as the
  *    backup pipeline.
  *
- * 3. The SqlDumpParser reads decompressed SQL line-by-line and extracts
- *    only the requested tables into bounded php://temp buffers.
+ * 3. No full decompressed dump ever exists in one place. Each chunk read
+ *    from the decompressor's stdout is fed directly into the SqlDumpParser
+ *    as it arrives — the parser routes lines into bounded per-table
+ *    php://temp buffers on the fly. There is no intermediate buffer holding
+ *    the whole decompressed dump, on disk or in memory.
  *
  * 4. The TableRestorer executes inside a single DB transaction with
  *    FK checks disabled.
@@ -47,7 +50,6 @@ final class RestorePipeline
         private readonly CompressionDriver $compression,
         private readonly EncryptionFactory $encryptionFactory,
         private readonly EncryptionKeyResolver $keyResolver,
-        private readonly SqlDumpParser $parser,
         private readonly TableRestorer $restorer,
         private readonly DownloadDriver $downloader,
         private readonly Config $config,
@@ -90,33 +92,26 @@ final class RestorePipeline
 
         try {
             // 5. Pipe the decrypted stream into the decompressor's stdin,
-            //    while simultaneously reading decompressed SQL from stdout.
-            //    Collect the full decompressed output into a temp stream
-            //    that the SqlDumpParser can read line-by-line.
-            Log::debug("[RestorePipeline] Piping stream to decompressor...");
-            $sqlStream = $this->pipeToDecompressor(
+            //    while simultaneously feeding decompressed SQL, chunk by
+            //    chunk, straight into the SqlDumpParser. The parser routes
+            //    each line into a bounded per-table buffer as it arrives —
+            //    the full decompressed dump never accumulates anywhere.
+            if ($onProgress) {
+                $onProgress(RestoreStatus::Parsing);
+            }
+            $parser = new SqlDumpParser($context->tables);
+            Log::debug("[RestorePipeline] Piping stream to decompressor and parsing inline...");
+            $this->pipeToDecompressor(
                 $decryptedStream,
                 $decompProc,
                 $decompStdin,
                 $decompStdout,
                 $decompStderr,
                 $readChunk,
+                $parser,
             );
-            $streamStats = fstat($sqlStream);
-            Log::debug("[RestorePipeline] Decompression finished. Temp stream size: " . ($streamStats['size'] ?? 'unknown') . " bytes.");
-
-            // 6. Parse the decompressed SQL to extract requested table blocks.
-            if ($onProgress) {
-                $onProgress(RestoreStatus::Parsing);
-            }
-            Log::debug("[RestorePipeline] Parsing SQL stream for requested tables...");
-            $tableBlocks = $this->parser->parse($sqlStream, $context->tables);
-            Log::debug("[RestorePipeline] Parsing completed. Found " . count($tableBlocks) . " table blocks.");
-
-            // Close the sql stream now that parsing is complete.
-            if (is_resource($sqlStream)) {
-                fclose($sqlStream);
-            }
+            $tableBlocks = $parser->finish();
+            Log::debug("[RestorePipeline] Decompression and parsing completed. Found " . count($tableBlocks) . " table blocks.");
 
             // Exclude the package's own tracking tables to prevent the
             // restore from destroying its own restore record. A full restore
@@ -198,10 +193,10 @@ final class RestorePipeline
     }
 
     /**
-     * Pipe the source stream into the decompressor and collect decompressed
-     * output into a php://temp stream using stream_select().
-     *
-     * @return resource php://temp stream containing the full decompressed SQL
+     * Pipe the source stream into the decompressor while, in the same loop,
+     * feeding each decompressed chunk read from stdout directly into the
+     * SqlDumpParser as it becomes available via stream_select(). No
+     * intermediate buffer ever holds the full decompressed dump.
      */
     private function pipeToDecompressor(
         BackupStream $source,
@@ -210,9 +205,9 @@ final class RestorePipeline
         mixed $decompStdout,
         mixed $decompStderr,
         int $readChunk,
-    ): mixed {
+        SqlDumpParser $parser,
+    ): void {
         Log::debug("[RestorePipeline] Entering pipeToDecompressor loop.");
-        $output = fopen('php://temp', 'r+b');
 
         $pendingChunk    = '';
         $sourceDone      = false;
@@ -286,7 +281,7 @@ final class RestorePipeline
                 if ($data === false || ($data === '' && feof($decompStdout))) {
                     $stdoutDone = true;
                 } elseif ($data !== '') {
-                    fwrite($output, $data);
+                    $parser->feed($data);
                 }
             }
 
@@ -315,9 +310,6 @@ final class RestorePipeline
 
         // Close the source stream (which may also close the decryption layer).
         $source->close();
-
-        rewind($output);
-        return $output;
     }
 
     /**
