@@ -130,7 +130,12 @@ class RunBackupJob implements ShouldQueue
             );
 
             $backup->markAs(BackupStatus::Uploading);
-            $result = $pipeline->run($this->context, $metadata);
+            // NOTE: must be `use (&$aborted)`, not an arrow fn — arrow
+            // functions capture by value at creation time, so they would
+            // never observe the SIGTERM handler flipping $aborted later.
+            $result = $pipeline->run($this->context, $metadata, cancellationRequested: static function () use (&$aborted): bool {
+                return $aborted;
+            });
 
             if ($aborted) {
                 throw new \RuntimeException('Backup aborted by SIGTERM.');
