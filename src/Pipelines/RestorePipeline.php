@@ -144,10 +144,10 @@ final class RestorePipeline
     /**
      * Remove excluded tables from the parsed table blocks.
      *
-     * The package's own tracking tables (backups, restores) must never be
-     * restored into the target database: doing so would DROP and recreate
-     * them with stale dump data, silently wiping the current restore
-     * record and replacing backup metadata with old data.
+     * The package's own tracking tables (backups, backup_attempts, restores)
+     * must never be restored into the target database: doing so would DROP
+     * and recreate them with stale dump data, silently wiping the current
+     * restore record and replacing backup metadata with old data.
      *
      * @param  array<string, resource> $tableBlocks
      * @return array<string, resource>
@@ -156,7 +156,7 @@ final class RestorePipeline
     {
         $excludeTables = array_map('strtolower', (array) $this->config->get(
             'stream-backup.restore.exclude_tables',
-            ['backups', 'restores'],
+            ['backups', 'backup_attempts', 'restores'],
         ));
 
         if ($excludeTables === []) {

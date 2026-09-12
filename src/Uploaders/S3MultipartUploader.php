@@ -8,6 +8,7 @@ use Ahmednour\StreamBackup\DTOs\BackupMetadata;
 use Ahmednour\StreamBackup\DTOs\UploadResult;
 use Ahmednour\StreamBackup\Exceptions\PipelineException;
 use Ahmednour\StreamBackup\Models\Backup;
+use Ahmednour\StreamBackup\Models\BackupAttempt;
 use Ahmednour\StreamBackup\Uploaders\Sessions\S3MultipartSession;
 use Ahmednour\StreamBackup\Uploaders\Sessions\WriteSession;
 use Aws\S3\S3ClientInterface;
@@ -55,6 +56,9 @@ final class S3MultipartUploader implements UploadDriver
         }
 
         Backup::query()->whereKey($metadata->backupId)->update(['upload_id' => $uploadId]);
+        if ($metadata->attemptId !== null) {
+            BackupAttempt::query()->whereKey($metadata->attemptId)->update(['upload_id' => $uploadId]);
+        }
 
         return new S3MultipartSession($uploadId, $metadata); // ← subclass, not MultipartSession
     }
@@ -82,6 +86,11 @@ final class S3MultipartUploader implements UploadDriver
         Backup::query()->whereKey($session->metadata->backupId)->update([
             'parts_uploaded' => $session->partCount(),
         ]);
+        if ($session->metadata->attemptId !== null) {
+            BackupAttempt::query()->whereKey($session->metadata->attemptId)->update([
+                'parts_uploaded' => $session->partCount(),
+            ]);
+        }
     }
 
     public function complete(WriteSession $session): UploadResult
