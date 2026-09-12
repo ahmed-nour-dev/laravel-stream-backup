@@ -248,6 +248,12 @@ return [
     |
     | Behaviour controls for the streaming restore executor.
     |
+    | NOTE: Restore currently supports MySQL backups only. The parser
+    |   understands mysqldump output; restoring a PostgreSQL (pg_dump) or
+    |   SQLite (sqlite3 .dump) backup is not supported yet, even though
+    |   backup (dump) supports all three databases. See the README's
+    |   "Roadmap" section for tracking.
+    |
     | strip_definers: mysqldump embeds DEFINER=`user`@`host` clauses in every
     |   view, procedure, function, trigger and event. Restoring these under a
     |   MySQL user that lacks SUPER / SET_USER_ID (common on managed cloud
