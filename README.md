@@ -9,9 +9,9 @@
 
 Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore is currently MySQL-only**; see the [support matrix](#supported-databases) below.
 
-**Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. Nothing is ever buffered to disk and nothing exceeds the 32 MB part buffer in RAM, so a 300 GB database and a 3 GB database use roughly the same amount of memory.
+**Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. No database-sized temporary file is ever created: the pipeline holds at most one multipart part (default 32 MB) in a bounded `php://temp` buffer, which itself spills to disk past 2 MB. So a 300 GB database and a 3 GB database use roughly the same amount of memory, and roughly the same small, bounded amount of scratch disk space — see [Temporary Disk Usage](#temporary-disk-usage) for exact thresholds.
 
-**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction, without buffering the backup file to disk. The parser understands `mysqldump` output only, so restore currently targets **MySQL backups**; restoring a PostgreSQL or SQLite dump is not supported (see [Roadmap](#roadmap)).
+**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction. Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. The parser understands `mysqldump` output only, so restore currently targets **MySQL backups**; restoring a PostgreSQL or SQLite dump is not supported (see [Roadmap](#roadmap)).
 
 This package is the productised form of the proof-of-concept script [`backup.php`](./backup.php).
 
@@ -25,7 +25,7 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 | --- | --- | --- |
 | **Backup Process** | Dumps to local disk → Zips on disk → Uploads to S3 | Streams dump to compressor → Streams directly to destination |
 | **Destination Drivers** | S3, local | **S3, SFTP, Local disk** |
-| **Local Disk Required** | Yes (>100% of DB size) | **No (Zero bytes)** |
+| **Local Disk Required** | Yes (>100% of DB size) | **No database-sized staging** (bounded buffers may spill a few MB to disk — see [Temporary Disk Usage](#temporary-disk-usage)) |
 | **Memory Usage** | Variable | **Constant (~32 MB buffer)** |
 | **Encryption** | ❌ No built-in encryption | **AES-256-GCM or XChaCha20-Poly1305** |
 | **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports (MySQL backups only) |
@@ -182,7 +182,7 @@ php artisan backup:cleanup                 # apply retention policy
 
 > ⚠️ **MySQL only.** `backup:restore` parses `mysqldump` output; it does not currently support restoring PostgreSQL or SQLite backups, even though backup (dump) supports all three. See [Roadmap](#roadmap).
 
-You can restore a backup directly from any configured storage driver without downloading the entire file to disk.
+You can restore a backup from S3 or local disk directly as a stream, without downloading the entire file to disk first. SFTP restores currently spool the whole file into a temporary stream before parsing, due to a `phpseclib` limitation — see [Temporary Disk Usage](#temporary-disk-usage).
 
 ```bash
 # Full restore
@@ -300,7 +300,7 @@ php -r "echo base64_encode(random_bytes(32));"
 | `encryption.driver` | `none` | `none`, `openssl-aes-256-gcm`, `sodium`, or custom |
 | `encryption.key` | — | Base64-encoded 32-byte raw key |
 | `encryption.key_file` | — | Path to file containing raw binary key (32 bytes) |
-| `multipart.part_size` | 32 MB | Must be ≥ 5 MB; keeps part count < 10 000 even at 300 GB |
+| `multipart.part_size` | 32 MB | Must be ≥ 5 MB; keeps part count < 10 000 even at 300 GB. Also bounds the backup pipeline's `php://temp` part buffer — see [Temporary Disk Usage](#temporary-disk-usage) |
 | `read_chunk` | 64 KB | Bytes pulled per `stream_select` iteration |
 | `retention.daily` | 7 | Daily backups kept |
 | `retention.weekly` | 4 | Weekly (non-last-Sunday) backups kept |
@@ -320,6 +320,8 @@ php -r "echo base64_encode(random_bytes(32));"
 | `restore.skippable_error_codes` | `[1227]` | MySQL error codes ignored when `skip_on_error` is `true`. Only used if `skip_on_error` is enabled |
 | `restore.atomic_restore` | `true` | Rename-aside shadow tables for cross-table rollback on failure |
 | `restore.exclude_tables` | `['backups', 'restores']` | Tables never touched by a restore, so the package's own tracking data survives |
+
+> The 2 MB `php://temp` memory-to-disk spill thresholds used by the restore path (PHP's own default, and `SqlDumpParser::TEMP_MAX_MEMORY`) are currently fixed constants, not config keys. See [Temporary Disk Usage](#temporary-disk-usage).
 
 ## Architecture
 
@@ -359,6 +361,20 @@ SqlDumpParser (extracts requested tables)
 TableRestorer (runs inside a DB transaction)
 ```
 
+### Temporary Disk Usage
+
+The package's guarantee is **no database-sized temporary files**, not literal zero-byte disk usage. Several stages use bounded `php://temp` streams, which PHP transparently promotes from an in-memory buffer to a real temp file once they exceed a fixed threshold — trading a small, predictable amount of disk I/O for a hard cap on memory use.
+
+| Stage | Buffer | Spills to disk past | Bounded by |
+|---|---|---|---|
+| Backup: multipart/chunked part buffer (`StreamPipeline`) | One `php://temp` per upload part | 2 MB (PHP's default) | `multipart.part_size` (default 32 MB) — constant regardless of database size |
+| Restore: per-table buffer (`SqlDumpParser`) | One `php://temp` per requested table | 2 MB (`SqlDumpParser::TEMP_MAX_MEMORY`) | That table's own dump output size — a very large table can spill its full size to disk |
+| Restore: SFTP download (`SftpDownloadDriver`) | One `php://temp` for the entire backup file | 2 MB (PHP's default) | The whole backup file's size — `phpseclib3` has no incremental read API, so the full file is spooled before parsing begins |
+
+`S3DownloadDriver` and `LocalDownloadDriver` stream the backup file directly and never spool it whole; only the per-table `SqlDumpParser` buffer above applies to them.
+
+In short: backup-time disk usage is capped at roughly `multipart.part_size` no matter how large the database is. Restore-time disk usage is bounded per table rather than by the full database — but restoring one enormous table, or restoring anything over SFTP, can still write a large amount of temporary data to disk.
+
 ### Design Patterns
 
 | Pattern | Where | Purpose |
@@ -375,7 +391,7 @@ TableRestorer (runs inside a DB transaction)
 - **Write-side `stream_select`** with a `$pendingChunk` buffer — never busy-waits on blocked pipes.
 - **Exit-code validation before `completeMultipartUpload`** — refuses to commit objects when the dump or compression process exited non-zero or printed recognisable errors to stderr.
 - **Driver-specific preflight checks** — each upload driver performs a write+delete test using its own transport (S3, SFTP, local FS) before starting the backup.
-- **`php://temp` part buffer** — zero copy, spills to disk past 2 MB.
+- **`php://temp` part buffer** — zero copy, spills to disk past 2 MB, bounded by `multipart.part_size` (see [Temporary Disk Usage](#temporary-disk-usage)).
 - **Secure credential handling** — MySQL: temp file with `chmod 0600`; PostgreSQL: `PGPASSWORD` env var; SQLite: no credentials needed.
 - **Encryption key isolation** — raw key material is resolved just-in-time by `EncryptionKeyResolver`, passed to the driver, and wiped from memory on `close()`.
 - **Redis-backed semaphore** via `Cache::lock()` prevents dozens of simultaneous dumps.
