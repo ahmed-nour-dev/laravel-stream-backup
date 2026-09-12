@@ -14,6 +14,7 @@ use Ahmednour\StreamBackup\Encryption\EncryptionFactory;
 use Ahmednour\StreamBackup\Events\CompressionCompleted;
 use Ahmednour\StreamBackup\Events\DatabaseDumped;
 use Ahmednour\StreamBackup\Events\UploadFinished;
+use Ahmednour\StreamBackup\Exceptions\PipelineCancelledException;
 use Ahmednour\StreamBackup\Exceptions\PipelineException;
 use Ahmednour\StreamBackup\Streams\ChecksumStream;
 use Ahmednour\StreamBackup\Streams\ProcessBackupStream;
@@ -58,7 +59,14 @@ final class StreamPipeline
     ) {
     }
 
-    public function run(BackupContext $context, BackupMetadata $metadata): UploadResult
+    /**
+     * @param (\Closure(): bool)|null $cancellationRequested Polled once per
+     *  stream_select() iteration (at most every 200ms). When it returns true,
+     *  the pipeline aborts the in-flight multipart upload, terminates the
+     *  dump/compressor processes, and throws PipelineCancelledException —
+     *  instead of running to completion before honoring the cancellation.
+     */
+    public function run(BackupContext $context, BackupMetadata $metadata, ?\Closure $cancellationRequested = null): UploadResult
     {
         $readChunk = (int) $this->config->get('stream-backup.read_chunk', 64 * 1024);
         $partSize  = (int) $this->config->get('stream-backup.multipart.part_size', 32 * 1024 * 1024);
@@ -108,6 +116,10 @@ final class StreamPipeline
 
         try {
             while (true) {
+                if ($cancellationRequested !== null && $cancellationRequested()) {
+                    throw new PipelineCancelledException('Backup pipeline cancelled.');
+                }
+
                 $read  = [];
                 $write = [];
                 $except = null;
