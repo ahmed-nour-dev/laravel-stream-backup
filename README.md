@@ -7,11 +7,11 @@
 
 > Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → transaction restores for Laravel 10+, with **constant memory use** regardless of database size.
 
-Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory`.
+Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore is currently MySQL-only**; see the [support matrix](#supported-databases) below.
 
 **Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. Nothing is ever buffered to disk and nothing exceeds the 32 MB part buffer in RAM, so a 300 GB database and a 3 GB database use roughly the same amount of memory.
 
-**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction, without buffering the backup file to disk.
+**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction, without buffering the backup file to disk. The parser understands `mysqldump` output only, so restore currently targets **MySQL backups**; restoring a PostgreSQL or SQLite dump is not supported (see [Roadmap](#roadmap)).
 
 This package is the productised form of the proof-of-concept script [`backup.php`](./backup.php).
 
@@ -28,7 +28,7 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 | **Local Disk Required** | Yes (>100% of DB size) | **No (Zero bytes)** |
 | **Memory Usage** | Variable | **Constant (~32 MB buffer)** |
 | **Encryption** | ❌ No built-in encryption | **AES-256-GCM or XChaCha20-Poly1305** |
-| **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports |
+| **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports (MySQL backups only) |
 | **Best For** | Small to medium databases | Large databases & multi-tenant setups |
 
 ---
@@ -56,12 +56,16 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 
 ## Supported Databases
 
-| Database   | Dump Tool    | Credential Handling | Notes |
-|---|---|---|---|
-| MySQL      | `mysqldump`  | Temp credential file (`--defaults-extra-file`) | Default; backward compatible |
-| PostgreSQL | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
-| SQLite     | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
-| Custom     | Your choice  | Your choice | Register via `DumperFactory::extend()` |
+**Backup and restore are not the same feature.** Backup (dump) supports MySQL, PostgreSQL, and SQLite. Restore currently only understands `mysqldump` output, so it supports MySQL backups only — restoring a PostgreSQL or SQLite backup is **not currently supported**.
+
+| Database   | Backup | Restore | Dump Tool    | Credential Handling | Notes |
+|---|---|---|---|---|---|
+| MySQL      | ✅ Yes | ✅ Yes | `mysqldump`  | Temp credential file (`--defaults-extra-file`) | Default; backward compatible |
+| PostgreSQL | ✅ Yes | ❌ Not currently supported | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
+| SQLite     | ✅ Yes | ❌ Not currently supported | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
+| Custom     | Your choice | ❌ Not supported | Your choice  | Your choice | Register via `DumperFactory::extend()` |
+
+PostgreSQL and SQLite restore support is tracked as follow-up work — see [Roadmap](#roadmap).
 
 ## Supported Destinations
 
@@ -170,6 +174,8 @@ php artisan backup:cleanup                 # apply retention policy
 ```
 
 ### Restore
+
+> ⚠️ **MySQL only.** `backup:restore` parses `mysqldump` output; it does not currently support restoring PostgreSQL or SQLite backups, even though backup (dump) supports all three. See [Roadmap](#roadmap).
 
 You can restore a backup directly from any configured storage driver without downloading the entire file to disk.
 
@@ -383,6 +389,10 @@ All of these are resolved from the container and can be swapped:
 - `DownloadDriver` — `S3DownloadDriver`, `SftpDownloadDriver`, or `LocalDownloadDriver`
 - `TenantResolver` — `ConfigTenantResolver` when `tenants` is populated, `SingleDatabaseResolver` otherwise
 - `BackupStream` — chunked non-blocking stream abstraction
+
+## Roadmap
+
+- **PostgreSQL and SQLite restore support** — `SqlDumpParser` currently only understands `mysqldump` output, so `backup:restore` is limited to MySQL backups. Extending the restore pipeline to parse `pg_dump` and `sqlite3 .dump` output is tracked in the project's [issue tracker](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues); backup (dump) already supports all three databases.
 
 ## Testing
 

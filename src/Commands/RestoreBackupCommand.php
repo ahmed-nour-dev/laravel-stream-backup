@@ -15,7 +15,8 @@ class RestoreBackupCommand extends Command
                             {--connection= : The database connection to restore into (default: the backup\'s original connection)}
                             {--force : Force the operation to run when in production}';
 
-    protected $description = 'Restore a backup (full or specific tables) via a non-blocking stream';
+    protected $description = 'Restore a MySQL backup (full or specific tables) via a non-blocking stream. '
+        . 'PostgreSQL and SQLite backups are not currently supported for restore.';
 
     public function handle(BackupManager $manager): int
     {
