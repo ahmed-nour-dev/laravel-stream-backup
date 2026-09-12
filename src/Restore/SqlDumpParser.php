@@ -44,6 +44,13 @@ final class SqlDumpParser
     private const TABLE_DATA_PATTERN = '/^-- Dumping data for table `?([^`]+)`?\s*$/';
 
     /**
+     * Regex matching a `CONSTRAINT ... FOREIGN KEY (...) REFERENCES parent`
+     * clause inside a CREATE TABLE statement. Captures the referenced
+     * (parent) table name, with or without backtick quoting.
+     */
+    private const FOREIGN_KEY_PATTERN = '/FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+`?([A-Za-z0-9_]+)`?/i';
+
+    /**
      * Max memory (bytes) for php://temp buffers before spilling to disk.
      * 2 MB keeps RAM bounded while avoiding unnecessary disk I/O for
      * small tables.
@@ -68,6 +75,16 @@ final class SqlDumpParser
     private string $pending = '';
 
     private bool $finished = false;
+
+    /**
+     * FK [parent, child] edges parsed directly out of the CREATE TABLE
+     * statements captured while feeding this parser. Populated regardless of
+     * whether the referenced (parent) table itself is one of the requested
+     * tables — TableRestorer filters edges to its restore set.
+     *
+     * @var array<int, array{0: string, 1: string}>
+     */
+    private array $foreignKeys = [];
 
     /**
      * @param string[] $tables Tables to extract (empty = all tables)
@@ -203,6 +220,14 @@ final class SqlDumpParser
 
         // Write the current line to the active table's buffer.
         if ($this->currentTable !== null && isset($this->buffers[$this->currentTable])) {
+            // Capture FK edges straight out of the CREATE TABLE text so
+            // that a table newly introduced by this backup (which has no
+            // information_schema constraint row yet on the target) still
+            // contributes an edge to TableRestorer's dependency sort.
+            if (preg_match(self::FOREIGN_KEY_PATTERN, $line, $fkMatches) === 1) {
+                $this->foreignKeys[] = [$fkMatches[1], $this->currentTable];
+            }
+
             fwrite($this->buffers[$this->currentTable], $line);
         }
     }
@@ -214,5 +239,21 @@ final class SqlDumpParser
                 fclose($buf);
             }
         }
+    }
+
+    /**
+     * FK [parent, child] edges parsed directly out of the CREATE TABLE
+     * statements captured while feeding this parser.
+     *
+     * Unlike information_schema (which only knows about constraints that
+     * already exist on the target), this reflects the dump's OWN declared
+     * FKs — including a table the dump is introducing for the first time, so
+     * TableRestorer's dependency sort can still order it after its parent.
+     *
+     * @return array<int, array{0: string, 1: string}> list of [parent, child]
+     */
+    public function getForeignKeys(): array
+    {
+        return $this->foreignKeys;
     }
 }

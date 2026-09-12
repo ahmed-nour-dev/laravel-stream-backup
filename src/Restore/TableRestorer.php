@@ -51,23 +51,19 @@ use Illuminate\Support\Facades\Log;
  * mysqldump emits tables alphabetically, which does NOT match FK-dependency
  * order in general (child tables often sort before their parents). So before
  * the restore loop the table blocks are topologically sorted parents-first,
- * driven by the existing schema's information_schema.referential_constraints,
- * with dump order preserved for tables with no FK relationship. This makes
- * full-schema restores safe regardless of mysqldump's alphabetical ordering.
+ * driven by two merged edge sources: the existing schema's
+ * information_schema.referential_constraints, AND FK declarations parsed
+ * directly out of the dump's own CREATE TABLE statements (SqlDumpParser's
+ * getForeignKeys(), passed in as $dumpFkEdges). The second source is what
+ * makes a table newly introduced by this restore order correctly: it has no
+ * constraint row on the target yet, so information_schema alone can't see
+ * it, but its FK is right there in the CREATE TABLE text. Dump order is
+ * preserved for tables with no FK relationship in either source.
  *
  * Remaining caveat: a SELECTIVE restore of a table that is an FK parent of a
  * table NOT included in the restore still repoints the unrestored child's FK
  * to `_sbr_*`, which is dropped on success → orphaned FK metadata. Disable
  * `restore.atomic_restore` to opt out of shadow tables entirely.
- *
- * Residual gap (smaller): the dependency sort reads FK edges from
- * information_schema (the EXISTING schema), so a brand-new child table ADDED
- * by this restore run that references a pre-existing parent has no constraint
- * row yet and its edge won't be captured — the same failure mode can resurface
- * in the narrow case of adding a new FK-child table in the same run as
- * replacing its parent. Parsing FK declarations out of the dump's own
- * CREATE TABLE buffers (which TableRestorer already holds) would close it;
- * tracked as a follow-up ticket.
  *
  * SKIP-ON-ERROR INTERACTION
  * -------------------------
@@ -123,15 +119,21 @@ final class TableRestorer
     /**
      * Restore the given table blocks into the target database.
      *
-     * @param array<string, resource> $tableBlocks Map of table_name => php://temp stream
-     * @param string                  $connection  Laravel DB connection name
+     * @param array<string, resource>              $tableBlocks Map of table_name => php://temp stream
+     * @param string                                $connection  Laravel DB connection name
+     * @param array<int, array{0: string, 1: string}> $dumpFkEdges FK [parent, child] edges parsed
+     *                                              directly out of the dump's own CREATE TABLE
+     *                                              statements (see SqlDumpParser::getForeignKeys()),
+     *                                              merged with the existing-schema graph so a table
+     *                                              newly introduced by this restore still orders
+     *                                              after a parent it references.
      * @return RestoreResult
      *
      * @throws RestoreFailedException If any SQL execution fails, or if stale
      *                                shadow tables from a previous crashed
      *                                restore are detected.
      */
-    public function restore(array $tableBlocks, string $connection, float $startTime): RestoreResult
+    public function restore(array $tableBlocks, string $connection, float $startTime, array $dumpFkEdges = []): RestoreResult
     {
         $db = DB::connection($connection);
         $totalRows      = 0;
@@ -165,7 +167,7 @@ final class TableRestorer
             // child is recreated before its parent is renamed aside, the
             // parent's later rename repoints the child's fresh FK to the
             // _sbr_* shadow (dropped at the end) → orphaned FK metadata.
-            $tableBlocks = $this->orderTablesByDependency($db, $tableBlocks);
+            $tableBlocks = $this->orderTablesByDependency($db, $tableBlocks, $dumpFkEdges);
 
             foreach ($tableBlocks as $tableName => $buffer) {
                 $currentTable = $tableName;
@@ -551,14 +553,18 @@ final class TableRestorer
      * match FK-dependency order in general.
      *
      * The graph is read from the EXISTING schema's
-     * information_schema.referential_constraints, so it is exact for a full
-     * restore into a schema that matches the dump. Tables not present in the
-     * existing schema (or with no FK relationship) keep their dump order.
+     * information_schema.referential_constraints, merged with FK edges parsed
+     * directly out of the dump's own CREATE TABLE statements ($dumpFkEdges) —
+     * this second source covers a table newly introduced by this restore,
+     * which has no constraint row on the target yet and so would otherwise be
+     * invisible to the existing-schema query. Tables with no FK relationship
+     * (in either source) keep their dump order.
      *
-     * @param array<string, resource> $tableBlocks
+     * @param array<string, resource>                 $tableBlocks
+     * @param array<int, array{0: string, 1: string}> $dumpFkEdges
      * @return array<string, resource>
      */
-    private function orderTablesByDependency(ConnectionInterface $db, array $tableBlocks): array
+    private function orderTablesByDependency(ConnectionInterface $db, array $tableBlocks, array $dumpFkEdges = []): array
     {
         $tables = array_values(array_keys($tableBlocks));
 
@@ -566,7 +572,12 @@ final class TableRestorer
             return $tableBlocks;
         }
 
-        $ordered = self::orderTables($tables, $this->fkEdges($db, $tables));
+        $edges = array_merge(
+            $this->fkEdges($db, $tables),
+            self::filterEdgesToTableSet($dumpFkEdges, $tables),
+        );
+
+        $ordered = self::orderTables($tables, $edges);
 
         $result = [];
         foreach ($ordered as $table) {
@@ -617,6 +628,27 @@ final class TableRestorer
         }
 
         return $edges;
+    }
+
+    /**
+     * Restrict a list of [parent, child] edges to those whose BOTH endpoints
+     * are in the restore set — same rationale as fkEdges(): a parent outside
+     * the set is never renamed aside, so it cannot trigger the
+     * rename-follows-FK repointing the dependency sort exists to prevent.
+     * Pure (no DB), so it is directly unit-testable.
+     *
+     * @param array<int, array{0: string, 1: string}> $edges
+     * @param string[]                                $tables
+     * @return array<int, array{0: string, 1: string}>
+     */
+    public static function filterEdgesToTableSet(array $edges, array $tables): array
+    {
+        $set = array_flip($tables);
+
+        return array_values(array_filter(
+            $edges,
+            static fn (array $edge): bool => isset($set[$edge[0]], $set[$edge[1]]),
+        ));
     }
 
     /**
