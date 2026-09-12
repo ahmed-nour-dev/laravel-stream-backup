@@ -134,6 +134,49 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Timeouts
+    |--------------------------------------------------------------------------
+    |
+    | RunBackupJob deliberately sets Laravel's queue $timeout to 0 (unlimited)
+    | because a database dump can legitimately run for hours — a worker
+    | timeout sized for typical jobs would SIGKILL it mid-stream. These two
+    | settings are safeguards that apply INSTEAD, independently of the queue
+    | worker's own timeout:
+    |
+    |   max_runtime:  hard ceiling (seconds) on the whole backup — dump,
+    |       compress, encrypt and upload combined — measured from the moment
+    |       RunBackupJob starts working the job. Exceeding it throws
+    |       MaxRuntimeExceededException, aborts the in-flight multipart
+    |       upload, terminates the dump/compressor processes, and marks the
+    |       backup BackupStatus::TimedOut. A per-tenant override is available
+    |       via the `timeout` key on a `stream-backup.tenants` entry (see
+    |       ConfigTenantResolver) — set there to a value > 0 to override this
+    |       default for that tenant only.
+    |
+    |   idle_timeout: detects a STALLED pipeline rather than a slow-but-moving
+    |       one. Reset every time the streaming pipeline reads a chunk from
+    |       the dump, writes to the compressor, or reads compressed output —
+    |       so a database backup that is still steadily producing bytes never
+    |       trips this even if it runs for hours, but a wedged mysqldump,
+    |       compressor, or connection stall is caught quickly. Exceeding it
+    |       throws IdleTimeoutExceededException with the same cleanup and
+    |       terminal status as max_runtime.
+    |
+    | Set either to 0 to disable that safeguard (NOT recommended — a backup
+    | can then remain stuck indefinitely, held only by the queue worker
+    | itself). Both are cooperative checks polled once per stream_select
+    | iteration (~every 200ms) — like the existing SIGTERM handling, they
+    | cannot interrupt a single already-in-flight blocking call (e.g. one
+    | S3 uploadPart()), only bound the time before the NEXT one is prevented.
+    |
+    */
+    'timeouts' => [
+        'max_runtime'  => (int) env('STREAM_BACKUP_MAX_RUNTIME', 21600),  // 6 hours
+        'idle_timeout' => (int) env('STREAM_BACKUP_IDLE_TIMEOUT', 900),   // 15 minutes
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Retention
     |--------------------------------------------------------------------------
     |
@@ -178,6 +221,11 @@ return [
     | Example:
     |   ['connection' => 'tenant_1', 'database' => 'company_1', 'tenant_id' => 1],
     |   ['connection' => 'pg_tenant', 'database' => 'orders', 'tenant_id' => 2, 'driver' => 'pgsql'],
+    |   ['connection' => 'tenant_3', 'database' => 'huge_co', 'tenant_id' => 3, 'timeout' => 43200],
+    |
+    | 'timeout' (seconds, optional): overrides `timeouts.max_runtime` above
+    | for just this tenant — e.g. a much larger database that legitimately
+    | needs longer than the global default before being treated as stuck.
     |
     | Leave this empty to have backup:all fall back to a single BackupContext
     | derived from config('database.default').

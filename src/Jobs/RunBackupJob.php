@@ -10,6 +10,7 @@ use Ahmednour\StreamBackup\DTOs\BackupMetadata;
 use Ahmednour\StreamBackup\Dumpers\DumperFactory;
 use Ahmednour\StreamBackup\Encryption\EncryptionFactory;
 use Ahmednour\StreamBackup\Enums\BackupStatus;
+use Ahmednour\StreamBackup\Exceptions\BackupTimeoutException;
 use Ahmednour\StreamBackup\Models\Backup;
 use Ahmednour\StreamBackup\Pipelines\StreamPipeline;
 use Ahmednour\StreamBackup\Support\BackupPathBuilder;
@@ -20,6 +21,7 @@ use Ahmednour\StreamBackup\Events\BackupStarting;
 use Ahmednour\StreamBackup\Events\BackupSuccessful;
 use Ahmednour\StreamBackup\Support\PreflightChecker;
 use Ahmednour\StreamBackup\Support\RetentionClassifier;
+use Ahmednour\StreamBackup\Support\TimeoutGuard;
 use Carbon\CarbonImmutable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Cache\LockTimeoutException;
@@ -89,6 +91,15 @@ class RunBackupJob implements ShouldQueue
         $backup = null;
         try {
             $startedAt  = CarbonImmutable::now();
+            // Independent of Laravel's queue $timeout (0/unlimited above):
+            // a per-tenant BackupContext::$timeoutSeconds override wins over
+            // the global stream-backup.timeouts.max_runtime default.
+            $timeoutGuard = new TimeoutGuard(
+                maxRuntimeSeconds: $this->context->timeoutSeconds > 0
+                    ? $this->context->timeoutSeconds
+                    : (int) $config->get('stream-backup.timeouts.max_runtime', 0),
+                idleTimeoutSeconds: (int) $config->get('stream-backup.timeouts.idle_timeout', 0),
+            );
             $dumper     = $dumperFactory->make($this->context->driver);
             $encryption = $encryptionFactory->make();
             $backup = Backup::create([
@@ -133,9 +144,14 @@ class RunBackupJob implements ShouldQueue
             // NOTE: must be `use (&$aborted)`, not an arrow fn — arrow
             // functions capture by value at creation time, so they would
             // never observe the SIGTERM handler flipping $aborted later.
-            $result = $pipeline->run($this->context, $metadata, cancellationRequested: static function () use (&$aborted): bool {
-                return $aborted;
-            });
+            $result = $pipeline->run(
+                $this->context,
+                $metadata,
+                cancellationRequested: static function () use (&$aborted): bool {
+                    return $aborted;
+                },
+                timeoutGuard: $timeoutGuard,
+            );
 
             if ($aborted) {
                 throw new \RuntimeException('Backup aborted by SIGTERM.');
@@ -146,6 +162,11 @@ class RunBackupJob implements ShouldQueue
                 'checksum'          => $result->checksum,
                 'upload_speed_mbps' => $result->speedMbps(),
             ])->save();
+
+            // Re-checked here (status is still Uploading, which allows a
+            // TimedOut transition) because verification is not itself
+            // covered by the pipeline's per-iteration timeout checks.
+            $timeoutGuard->checkMaxRuntime();
 
             if ((bool) $config->get('stream-backup.verify_after_upload', true)) {
                 $backup->markAs(BackupStatus::Verifying);
@@ -160,15 +181,21 @@ class RunBackupJob implements ShouldQueue
 
             BackupSuccessful::dispatch($this->context, $backup);
         } catch (\Throwable $e) {
+            $status = match (true) {
+                $aborted                             => BackupStatus::Aborted,
+                $e instanceof BackupTimeoutException => BackupStatus::TimedOut,
+                default                               => BackupStatus::Failed,
+            };
+
             if ($backup !== null) {
                 try {
-                    $backup->markAs($aborted ? BackupStatus::Aborted : BackupStatus::Failed, [
+                    $backup->markAs($status, [
                         'error_message' => $e->getMessage(),
                         'finished_at'   => now(),
                     ]);
                 } catch (\Throwable) {
                     $backup->forceFill([
-                        'status'        => ($aborted ? BackupStatus::Aborted : BackupStatus::Failed)->value,
+                        'status'        => $status->value,
                         'error_message' => $e->getMessage(),
                         'finished_at'   => now(),
                     ])->save();

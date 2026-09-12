@@ -19,6 +19,7 @@ use Ahmednour\StreamBackup\Exceptions\PipelineException;
 use Ahmednour\StreamBackup\Streams\ChecksumStream;
 use Ahmednour\StreamBackup\Streams\ProcessBackupStream;
 use Ahmednour\StreamBackup\Support\EncryptionKeyResolver;
+use Ahmednour\StreamBackup\Support\TimeoutGuard;
 use Ahmednour\StreamBackup\Uploaders\Sessions\WriteSession;
 use Illuminate\Contracts\Config\Repository as Config;
 
@@ -65,11 +66,18 @@ final class StreamPipeline
      *  the pipeline aborts the in-flight multipart upload, terminates the
      *  dump/compressor processes, and throws PipelineCancelledException —
      *  instead of running to completion before honoring the cancellation.
+     * @param TimeoutGuard|null $timeoutGuard Polled once per stream_select()
+     *  iteration alongside $cancellationRequested. When either its max
+     *  runtime or idle-timeout budget is exceeded, the same abort/terminate
+     *  cleanup runs and MaxRuntimeExceededException / IdleTimeoutExceededException
+     *  is thrown. Defaults to one built from stream-backup.timeouts and
+     *  $context->timeoutSeconds when not supplied.
      */
-    public function run(BackupContext $context, BackupMetadata $metadata, ?\Closure $cancellationRequested = null): UploadResult
+    public function run(BackupContext $context, BackupMetadata $metadata, ?\Closure $cancellationRequested = null, ?TimeoutGuard $timeoutGuard = null): UploadResult
     {
         $readChunk = (int) $this->config->get('stream-backup.read_chunk', 64 * 1024);
         $partSize  = (int) $this->config->get('stream-backup.multipart.part_size', 32 * 1024 * 1024);
+        $timeoutGuard ??= $this->makeTimeoutGuard($context);
 
         // 1. Resolve the correct dumper for this context's driver.
         $dumper = $this->dumperFactory->make($context->driver);
@@ -119,6 +127,7 @@ final class StreamPipeline
                 if ($cancellationRequested !== null && $cancellationRequested()) {
                     throw new PipelineCancelledException('Backup pipeline cancelled.');
                 }
+                $timeoutGuard->check();
 
                 $read  = [];
                 $write = [];
@@ -158,8 +167,10 @@ final class StreamPipeline
 
                     if ($chunk === null) {
                         $dumpDone = true;
+                        $timeoutGuard->markProgress();
                     } elseif ($chunk !== '') {
                         $pendingChunk .= $chunk;
+                        $timeoutGuard->markProgress();
                     }
                 }
 
@@ -171,6 +182,7 @@ final class StreamPipeline
                     }
                     if ($written > 0) {
                         $pendingChunk = substr($pendingChunk, $written);
+                        $timeoutGuard->markProgress();
                     }
                 }
 
@@ -187,9 +199,11 @@ final class StreamPipeline
 
                     if ($compressed === null) {
                         $pigzDone = true;
+                        $timeoutGuard->markProgress();
                     } elseif ($compressed !== '') {
                         fwrite($partBuffer, $compressed);
                         $bufferSize += strlen($compressed);
+                        $timeoutGuard->markProgress();
 
                         if ($bufferSize >= $partSize) {
                             $this->flushPart($session, $partBuffer, $bufferSize, $partNumber);
@@ -245,6 +259,21 @@ final class StreamPipeline
         } finally {
             $this->closeIfOpen($partBuffer);
         }
+    }
+
+    /**
+     * Builds the default TimeoutGuard from global config, overridable
+     * per-tenant via BackupContext::$timeoutSeconds (> 0 wins).
+     */
+    private function makeTimeoutGuard(BackupContext $context): TimeoutGuard
+    {
+        $maxRuntime = $context->timeoutSeconds > 0
+            ? $context->timeoutSeconds
+            : (int) $this->config->get('stream-backup.timeouts.max_runtime', 0);
+
+        $idleTimeout = (int) $this->config->get('stream-backup.timeouts.idle_timeout', 0);
+
+        return new TimeoutGuard($maxRuntime, $idleTimeout);
     }
 
     /**

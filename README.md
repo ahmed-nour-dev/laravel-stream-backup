@@ -96,6 +96,11 @@ STREAM_BACKUP_MAX_CONCURRENT=2
 STREAM_BACKUP_QUEUE_CONNECTION=redis
 STREAM_BACKUP_QUEUE=backups
 
+# Timeout safeguards — independent of Laravel's queue worker timeout
+# (RunBackupJob sets $timeout = 0). Set either to 0 to disable it.
+STREAM_BACKUP_MAX_RUNTIME=21600   # 6h ceiling on the whole backup
+STREAM_BACKUP_IDLE_TIMEOUT=900    # 15m with no pipeline progress = stalled
+
 # Database dump driver: 'auto' (default), 'mysql', 'pgsql', 'sqlite'
 STREAM_BACKUP_DUMP_DRIVER=auto
 
@@ -296,6 +301,8 @@ php -r "echo base64_encode(random_bytes(32));"
 | `retention.monthly` | 6 | Monthly (last Sunday of month) backups kept |
 | `queue.max_concurrent` | 2 | Atomic semaphore cap across all workers |
 | `queue.slot_ttl` | 21 600 s | Per-slot lease; a crashed worker's slot auto-expires (6 h) |
+| `timeouts.max_runtime` | 21 600 s (6 h) | Hard ceiling on total backup runtime (dump+compress+upload). `0` disables it. Overridable per tenant via `tenants[].timeout` |
+| `timeouts.idle_timeout` | 900 s (15 m) | Aborts a backup that stops making forward progress (stalled dump/compressor/upload) even though the worker is still alive. `0` disables it |
 | `verify_after_upload` | `true` | Validates object size + gzip magic bytes after completion |
 | `auto_schedule` | `true` | Auto-register cleanup/stale-abort on Laravel scheduler |
 | `schedule.cleanup.frequency` | `daily` | Cleanup job cadence |
@@ -369,6 +376,24 @@ TableRestorer (runs inside a DB transaction)
 - **State-machine enum** (`BackupStatus`) with explicit `canTransitionTo()` guards every model transition.
 - **SIGTERM handling** with `pcntl_async_signals(true)` inside `RunBackupJob` — in-flight multipart uploads are aborted on graceful shutdown.
 - **Queue `$timeout = 0`** because backup runtime is determined by the DB, not by the worker.
+- **`TimeoutGuard`** enforces `timeouts.max_runtime` and `timeouts.idle_timeout` as safeguards that replace the disabled queue timeout — see [Timeouts](#timeouts) below.
+
+## Timeouts
+
+`RunBackupJob` deliberately sets Laravel's queue `$timeout` to `0` (unlimited) — a database dump can legitimately run for hours, and a worker timeout sized for typical jobs would `SIGKILL` it mid-stream, corrupting the object being uploaded. Instead, two independent, configurable safeguards bound how long a stuck backup can run:
+
+| Safeguard | Config key | Env var | Default | Detects |
+|---|---|---|---|---|
+| Max runtime | `timeouts.max_runtime` | `STREAM_BACKUP_MAX_RUNTIME` | 21 600 s (6 h) | Total backup time (dump + compress + encrypt + upload) exceeding a hard ceiling, even if it's still making progress |
+| Idle timeout | `timeouts.idle_timeout` | `STREAM_BACKUP_IDLE_TIMEOUT` | 900 s (15 m) | The pipeline stalling — no bytes read from the dump, written to the compressor, or read from the compressor — for that long, even though the worker process is still alive |
+
+Both are checked once per `stream_select()` iteration inside `StreamPipeline` (at most every ~200ms), the same polling cadence already used for SIGTERM cancellation. `max_runtime` is re-checked once more by `RunBackupJob` immediately after the pipeline finishes and before verification starts.
+
+- **Set either to `0`** to disable that particular safeguard. This is **not recommended**: a backup can then remain stuck indefinitely, bounded only by whatever eventually kills the queue worker (e.g. Supervisor, an OOM killer, a deploy).
+- **Per-tenant override**: `BackupContext::$timeoutSeconds` (populated from the `timeout` key of a `stream-backup.tenants` entry) overrides `max_runtime` for that tenant only — useful when one tenant's database is legitimately much larger than the rest.
+- **Which exception, which status**: exceeding either safeguard throws `MaxRuntimeExceededException` or `IdleTimeoutExceededException` (both extend `BackupTimeoutException extends PipelineException`), triggers the same cleanup as any other pipeline failure (multipart upload aborted, dump/compressor processes terminated), and marks the backup `BackupStatus::TimedOut` — distinct from a generic `Failed` so an operator can tell "the pipeline broke" apart from "the pipeline was too slow" at a glance.
+- **Interaction with the queue worker**: these safeguards are entirely independent of `--timeout` on `queue:work` (and of `$timeout` on the job itself, which stays `0`). Run backup workers with `--timeout=0` as `RunBackupJob` expects; if you must run them with a finite `--timeout` for other reasons, keep it comfortably above `max_runtime` — otherwise the worker's own SIGKILL fires first and you lose the graceful multipart-abort/process-cleanup these safeguards provide.
+- **Known limitation**: like the existing SIGTERM handling, these are cooperative checks — they cannot interrupt a single already-in-flight blocking call (e.g. one S3 `uploadPart()` on a wedged connection). They bound the time before the *next* such call is prevented, not an individual call already in progress. Configure your S3 client's own connect/read timeouts if you need a hard bound there too.
 
 ## Contracts / extension points
 
@@ -412,6 +437,11 @@ Unit tests cover:
 The feature test `StreamPipelineSmokeTest` is auto-skipped unless a dump tool + compressor are on `PATH` and `STREAM_BACKUP_TEST_*` env vars are set.
 
 ## Changelog
+
+### v1.4.0
+- Configurable `timeouts.max_runtime` and `timeouts.idle_timeout` safeguards, independent of Laravel's queue worker timeout — see [Timeouts](#timeouts)
+- New `BackupStatus::TimedOut`-producing `MaxRuntimeExceededException` / `IdleTimeoutExceededException`, both cleaned up the same way as any other pipeline failure (multipart abort + process termination)
+- Per-tenant `timeout` override wired up via `BackupContext::$timeoutSeconds`
 
 ### v1.3.1
 - Dispatch cleanup jobs to configured queue and connection
