@@ -364,7 +364,7 @@ return [
         // the backups table with stale data from the dump.
         // Set to [] to disable exclusion (e.g. when restoring into a
         // separate database where these tables don't matter).
-        'exclude_tables'        => ['backups', 'restores'],
+        'exclude_tables'        => ['backups', 'backup_attempts', 'restores'],
     ],
 
 ];

@@ -12,6 +12,7 @@ use Ahmednour\StreamBackup\Encryption\EncryptionFactory;
 use Ahmednour\StreamBackup\Enums\BackupStatus;
 use Ahmednour\StreamBackup\Exceptions\BackupTimeoutException;
 use Ahmednour\StreamBackup\Models\Backup;
+use Ahmednour\StreamBackup\Models\BackupAttempt;
 use Ahmednour\StreamBackup\Pipelines\StreamPipeline;
 use Ahmednour\StreamBackup\Support\BackupPathBuilder;
 use Ahmednour\StreamBackup\Support\BackupSemaphore;
@@ -88,7 +89,8 @@ class RunBackupJob implements ShouldQueue
             return;
         }
 
-        $backup = null;
+        $backup  = null;
+        $attempt = null;
         try {
             $startedAt  = CarbonImmutable::now();
             // Independent of Laravel's queue $timeout (0/unlimited above):
@@ -102,16 +104,46 @@ class RunBackupJob implements ShouldQueue
             );
             $dumper     = $dumperFactory->make($this->context->driver);
             $encryption = $encryptionFactory->make();
-            $backup = Backup::create([
-                'tenant_id'          => $this->context->tenantId,
-                'database_name'      => $this->context->databaseName,
-                'connection_name'    => $this->context->connectionName,
-                'disk'               => $this->context->disk,
-                'status'             => BackupStatus::Pending->value,
-                'compression_driver' => $compression->name(),
-                'dump_driver'        => $dumper->name(),
-                'encryption_driver'  => $encryption->name() !== 'none' ? $encryption->name() : null,
-                'started_at'         => $startedAt,
+
+            // One `backups` row per logical operation: every automatic
+            // queue retry re-executes handle() with the same $this->context
+            // (and therefore the same attemptGroupId), so this finds the
+            // row created by an earlier attempt instead of creating a new
+            // one. A failed retry never looks like an independent backup.
+            $backup = Backup::firstOrCreate(
+                ['attempt_group_id' => $this->context->attemptGroupId],
+                [
+                    'tenant_id'          => $this->context->tenantId,
+                    'database_name'      => $this->context->databaseName,
+                    'connection_name'    => $this->context->connectionName,
+                    'disk'               => $this->context->disk,
+                    'status'             => BackupStatus::Pending->value,
+                    'compression_driver' => $compression->name(),
+                    'dump_driver'        => $dumper->name(),
+                    'encryption_driver'  => $encryption->name() !== 'none' ? $encryption->name() : null,
+                    'started_at'         => $startedAt,
+                ],
+            );
+
+            if (! $backup->wasRecentlyCreated) {
+                // A retry of an already-attempted logical backup: reset the
+                // transient state left by the previous (failed) attempt so
+                // the logical record reflects this fresh run, not the last
+                // one's failure.
+                $backup->forceFill([
+                    'status'         => BackupStatus::Pending->value,
+                    'error_message'  => null,
+                    'finished_at'    => null,
+                    'duration'       => null,
+                    'upload_id'      => null,
+                    'parts_uploaded' => 0,
+                ])->save();
+            }
+
+            $attempt = $backup->attempts()->create([
+                'attempt_number' => $backup->attempts()->count() + 1,
+                'status'         => BackupStatus::Pending->value,
+                'started_at'     => $startedAt,
             ]);
 
             BackupStarting::dispatch($this->context, $backup);
@@ -124,6 +156,7 @@ class RunBackupJob implements ShouldQueue
                 'retention_tier' => $classifier->classify($startedAt)->value,
             ])->save();
             $backup->markAs(BackupStatus::Dumping);
+            $attempt->markAs(BackupStatus::Dumping);
 
             $bucket = (string) ($config->get("filesystems.disks.{$this->context->disk}.bucket")
                 ?? $this->context->disk);
@@ -138,9 +171,11 @@ class RunBackupJob implements ShouldQueue
                 contentType: $encryption->name() !== 'none'
                     ? 'application/octet-stream'
                     : 'application/gzip',
+                attemptId:   (int) $attempt->id,
             );
 
             $backup->markAs(BackupStatus::Uploading);
+            $attempt->markAs(BackupStatus::Uploading);
             // NOTE: must be `use (&$aborted)`, not an arrow fn — arrow
             // functions capture by value at creation time, so they would
             // never observe the SIGTERM handler flipping $aborted later.
@@ -170,14 +205,17 @@ class RunBackupJob implements ShouldQueue
 
             if ((bool) $config->get('stream-backup.verify_after_upload', true)) {
                 $backup->markAs(BackupStatus::Verifying);
+                $attempt->markAs(BackupStatus::Verifying);
                 $verifier->verify($backup);
             }
 
             $finishedAt = CarbonImmutable::now();
-            $backup->markAs(BackupStatus::Completed, [
+            $completedExtra = [
                 'finished_at' => $finishedAt,
                 'duration'    => $finishedAt->getTimestamp() - $startedAt->getTimestamp(),
-            ]);
+            ];
+            $backup->markAs(BackupStatus::Completed, $completedExtra);
+            $attempt->markAs(BackupStatus::Completed, $completedExtra);
 
             BackupSuccessful::dispatch($this->context, $backup);
         } catch (\Throwable $e) {
@@ -188,17 +226,23 @@ class RunBackupJob implements ShouldQueue
             };
 
             if ($backup !== null) {
+                $failureExtra = [
+                    'error_message' => $e->getMessage(),
+                    'finished_at'   => now(),
+                    'duration'      => now()->getTimestamp() - $startedAt->getTimestamp(),
+                ];
                 try {
-                    $backup->markAs($status, [
-                        'error_message' => $e->getMessage(),
-                        'finished_at'   => now(),
-                    ]);
+                    $backup->markAs($status, $failureExtra);
                 } catch (\Throwable) {
-                    $backup->forceFill([
-                        'status'        => $status->value,
-                        'error_message' => $e->getMessage(),
-                        'finished_at'   => now(),
-                    ])->save();
+                    $backup->forceFill(array_merge(['status' => $status->value], $failureExtra))->save();
+                }
+
+                if ($attempt !== null) {
+                    try {
+                        $attempt->markAs($status, $failureExtra);
+                    } catch (\Throwable) {
+                        $attempt->forceFill(array_merge(['status' => $status->value], $failureExtra))->save();
+                    }
                 }
             }
 

@@ -10,6 +10,7 @@ use Ahmednour\StreamBackup\DTOs\BackupMetadata;
 use Ahmednour\StreamBackup\DTOs\UploadResult;
 use Ahmednour\StreamBackup\Exceptions\PipelineException;
 use Ahmednour\StreamBackup\Models\Backup;
+use Ahmednour\StreamBackup\Models\BackupAttempt;
 use Ahmednour\StreamBackup\Uploaders\Sessions\SftpWriteSession;
 use Ahmednour\StreamBackup\Uploaders\Sessions\WriteSession;
 use phpseclib3\Net\SFTP;
@@ -102,6 +103,11 @@ final class SftpChunkedUploader implements UploadDriver
         Backup::query()->whereKey($session->metadata->backupId)->update([
             'parts_uploaded' => $session->partCount(),
         ]);
+        if ($session->metadata->attemptId !== null) {
+            BackupAttempt::query()->whereKey($session->metadata->attemptId)->update([
+                'parts_uploaded' => $session->partCount(),
+            ]);
+        }
     }
 
     public function complete(WriteSession $session): UploadResult

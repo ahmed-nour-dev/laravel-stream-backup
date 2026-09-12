@@ -8,6 +8,7 @@ use Ahmednour\StreamBackup\Enums\BackupStatus;
 use Ahmednour\StreamBackup\Enums\RetentionTier;
 use Ahmednour\StreamBackup\Exceptions\InvalidStatusTransitionException;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 /**
  * Eloquent model for the `backups` table.
@@ -16,6 +17,7 @@ use Illuminate\Database\Eloquent\Model;
  * enforces the state machine defined on BackupStatus::canTransitionTo().
  *
  * @property int|null         $id
+ * @property string|null      $attempt_group_id
  * @property string|null      $tenant_id
  * @property string           $database_name
  * @property string|null      $connection_name
@@ -74,5 +76,15 @@ class Backup extends Model
     public function scopeSuccessful($query)
     {
         return $query->where('status', BackupStatus::Completed->value);
+    }
+
+    /**
+     * Every queue execution (attempt) recorded against this logical backup,
+     * oldest first. A failed attempt followed by a successful retry shows
+     * up here as two rows rather than as two unrelated `Backup` records.
+     */
+    public function attempts(): HasMany
+    {
+        return $this->hasMany(BackupAttempt::class)->orderBy('attempt_number');
     }
 }

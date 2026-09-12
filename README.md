@@ -265,6 +265,36 @@ Invalid frequency values throw `InvalidConfigException` at boot time so typos su
 
 Add your own `backup:all` cadence to your app's scheduler.
 
+### Backup history & retries
+
+`RunBackupJob` has `$tries = 3`: a backup that fails (a transient dump
+error, a network blip mid-upload, ...) is automatically retried by the
+queue worker. Retries are tracked separately from the logical backup they
+belong to, so a large backup that fails after substantial work and
+succeeds on a later attempt never looks like several independent
+scheduled backups:
+
+- **`backups`** is the operator-facing record for one logical backup
+  operation (one `backup:tenant` / `backup:all` dispatch). Its `status`,
+  `finished_at`, and `error_message` always reflect the outcome of the
+  *most recent* attempt — `Completed` once any attempt succeeds, or the
+  failure from the last attempt once retries are exhausted.
+- **`backup_attempts`** has one row per execution of the job — `attempt_number`
+  (1, 2, 3, ...), `status`, `started_at`/`finished_at`/`duration`,
+  `error_message`, and the multipart `upload_id`/`parts_uploaded` state for
+  *that specific attempt*. A failed attempt keeps its own error message and
+  timing here even after a later attempt succeeds.
+
+```php
+$backup = Backup::find($id);
+
+$backup->attempts; // every execution, oldest first (Illuminate\Support\Collection<BackupAttempt>)
+```
+
+A backup that succeeded on its second try shows up as one `backups` row
+with `status = completed`, and two `backup_attempts` rows: attempt 1
+`failed` with its `error_message`, attempt 2 `completed`.
+
 ## Encryption
 
 Backups can be encrypted at rest using either of two built-in drivers:
@@ -319,7 +349,7 @@ php -r "echo base64_encode(random_bytes(32));"
 | `restore.skip_on_error` | `false` | Fail-fast by default: any restore SQL error aborts the run. Set `true` to swallow `skippable_error_codes` and continue best-effort instead |
 | `restore.skippable_error_codes` | `[1227]` | MySQL error codes ignored when `skip_on_error` is `true`. Only used if `skip_on_error` is enabled |
 | `restore.atomic_restore` | `true` | Rename-aside shadow tables for cross-table rollback on failure |
-| `restore.exclude_tables` | `['backups', 'restores']` | Tables never touched by a restore, so the package's own tracking data survives |
+| `restore.exclude_tables` | `['backups', 'backup_attempts', 'restores']` | Tables never touched by a restore, so the package's own tracking data survives |
 
 ## Architecture
 
@@ -446,9 +476,13 @@ Unit tests cover:
 
 The feature test `StreamPipelineSmokeTest` is auto-skipped unless a dump tool + compressor are on `PATH` and `STREAM_BACKUP_TEST_*` env vars are set.
 
+Feature tests also cover `RunBackupJob` retry behavior: a failed attempt followed by a successful retry must share one `backups` row and produce two `backup_attempts` rows (`RunBackupJobAttemptTrackingTest`).
+
 ## Changelog
 
 ### v1.4.0
+- Track backup attempts separately from the logical backup: `RunBackupJob` retries now share one `backups` row (matched via `attempt_group_id`) instead of creating an independent row per attempt
+- New `backup_attempts` table records per-attempt status, timing, failure reason, and multipart cleanup state
 - Configurable `timeouts.max_runtime` and `timeouts.idle_timeout` safeguards, independent of Laravel's queue worker timeout — see [Timeouts](#timeouts)
 - New `BackupStatus::TimedOut`-producing `MaxRuntimeExceededException` / `IdleTimeoutExceededException`, both cleaned up the same way as any other pipeline failure (multipart abort + process termination)
 - Per-tenant `timeout` override wired up via `BackupContext::$timeoutSeconds`
