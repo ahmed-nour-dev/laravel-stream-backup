@@ -386,6 +386,105 @@ final class RestoreRollbackTest extends TestCase
         self::assertTrue($enforced, 'FK on accessories must be enforced (reject a dangling widget_id) after a clean restore.');
     }
 
+    public function test_case_d_new_fk_child_table_orders_after_pre_existing_parent_via_dump_parsed_edge(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        // 'customers' is the ONLY table that pre-exists — 'orders' is brand
+        // new, introduced by this backup for the first time. Because it
+        // doesn't exist yet, information_schema.referential_constraints has
+        // no row for it, so the existing-schema query alone (pre-fix) cannot
+        // see that it depends on customers. This is the exact residual gap
+        // described in TableRestorer's class docblock.
+        $db->unprepared('CREATE TABLE `customers` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB');
+        $db->insert('INSERT INTO `customers` (`id`, `name`) VALUES (?, ?)', [1, 'original-customer']);
+
+        $customersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `customers`;\n"
+            . "CREATE TABLE `customers` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `name` VARCHAR(100) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `customers` (`id`, `name`) VALUES (1, 'restored-customer');\n"
+        );
+
+        $ordersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `orders`;\n"
+            . "CREATE TABLE `orders` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `customer_id` INT UNSIGNED NOT NULL,\n"
+            . "  `total` DECIMAL(10,2) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`),\n"
+            . "  CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `orders` (`id`, `customer_id`, `total`) VALUES (1, 1, 50.00);\n"
+        );
+
+        // Deliberately handed to restore() with the new child BEFORE its
+        // pre-existing parent — the exact ordering that orphans the FK
+        // without the dump-parsed edge below. In production this comes from
+        // SqlDumpParser::getForeignKeys() alongside its parse() call.
+        $tableBlocks = [
+            'orders'    => $ordersBlock,
+            'customers' => $customersBlock,
+        ];
+        $dumpFkEdges = [['customers', 'orders']];
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        $result = $restorer->restore($tableBlocks, 'mysql_test', microtime(true), $dumpFkEdges);
+
+        // The dump-parsed edge must have reordered parent-before-child even
+        // though information_schema has no constraint row for `orders` yet.
+        self::assertSame(['customers', 'orders'], $result->tablesRestored,
+            'Restore must process the pre-existing parent (customers) before the brand-new child (orders).');
+
+        $order = $db->selectOne('SELECT `total` FROM `orders` WHERE `id` = 1');
+        self::assertNotNull($order);
+        self::assertEquals(50.00, (float) $order->total);
+
+        // No leftover shadow tables (clean restore drops them).
+        $shadows = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.tables '
+            . 'WHERE table_schema = DATABASE() AND table_name LIKE CONCAT(?, ?, ?)',
+            ['_', 'sbr_', '%']
+        );
+        self::assertNotNull($shadows);
+        self::assertSame(0, (int) $shadows->n);
+
+        // THE key assertion: orders' FK must resolve to `customers` (the
+        // fresh parent), not a dropped _sbr_customers shadow.
+        $fk = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() '
+            . 'AND table_name = ? AND referenced_table_name = ?',
+            ['orders', 'customers']
+        );
+        self::assertNotNull($fk);
+        self::assertSame(1, (int) $fk->n, 'FK on orders must resolve to customers (not a dropped _sbr_* shadow) after a clean restore.');
+
+        // Live FK enforcement: a dangling customer_id insert must be rejected.
+        $db->unprepared('SET FOREIGN_KEY_CHECKS = 1');
+        $enforced = false;
+        try {
+            $db->insert(
+                'INSERT INTO `orders` (`customer_id`, `total`) VALUES (?, ?)',
+                [999999, 1.00]
+            );
+        } catch (\Throwable) {
+            $enforced = true;
+        }
+        self::assertTrue($enforced, 'FK on orders must be enforced (reject a dangling customer_id) after restore.');
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------

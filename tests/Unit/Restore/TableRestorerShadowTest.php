@@ -143,4 +143,61 @@ final class TableRestorerShadowTest extends TestCase
 
         self::assertSame(['a', 'b'], $ordered);
     }
+
+    // -- filterEdgesToTableSet (dump-parsed FK edges) -------------------------
+    // These back the fix for a table newly introduced by the backup: its FK
+    // is parsed straight out of the dump's CREATE TABLE text (see
+    // SqlDumpParserTest) rather than read from information_schema, and must
+    // be filtered/merged the same way as the existing-schema edges before
+    // orderTables() runs.
+
+    public function test_filter_edges_to_table_set_keeps_edges_with_both_endpoints_in_the_set(): void
+    {
+        $filtered = TableRestorer::filterEdgesToTableSet(
+            [['customers', 'orders']],
+            ['customers', 'orders'],
+        );
+
+        self::assertSame([['customers', 'orders']], $filtered);
+    }
+
+    public function test_filter_edges_to_table_set_drops_edges_whose_parent_is_outside_the_set(): void
+    {
+        // A parent outside the restore set is never renamed aside, so it
+        // cannot trigger the rename-follows-FK repointing the ordering
+        // exists to prevent — the edge must be dropped, not just ignored.
+        $filtered = TableRestorer::filterEdgesToTableSet(
+            [['customers', 'orders']],
+            ['orders'],
+        );
+
+        self::assertSame([], $filtered);
+    }
+
+    public function test_filter_edges_to_table_set_drops_edges_whose_child_is_outside_the_set(): void
+    {
+        $filtered = TableRestorer::filterEdgesToTableSet(
+            [['customers', 'orders']],
+            ['customers'],
+        );
+
+        self::assertSame([], $filtered);
+    }
+
+    public function test_dump_parsed_fk_edge_orders_a_brand_new_child_after_its_pre_existing_parent(): void
+    {
+        // The exact gap this ticket closes: a new child ('orders') with no
+        // information_schema row yet sorts before its pre-existing parent
+        // ('customers') in dump order. The edge parsed out of the dump's own
+        // CREATE TABLE text must be enough to reorder it, with no
+        // information_schema edges involved at all.
+        $dumpFkEdges = TableRestorer::filterEdgesToTableSet(
+            [['customers', 'orders']],
+            ['orders', 'customers'],
+        );
+
+        $ordered = TableRestorer::orderTables(['orders', 'customers'], $dumpFkEdges);
+
+        self::assertSame(['customers', 'orders'], $ordered);
+    }
 }

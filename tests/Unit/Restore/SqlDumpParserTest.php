@@ -15,6 +15,14 @@ use Ahmednour\StreamBackup\Tests\TestCase;
  * regardless of how the input is chunked, including splits that land
  * mid-line or mid-marker — exactly what happens when data arrives from a
  * live decompressor pipe instead of a single pre-buffered stream.
+ *
+ * Also covers SqlDumpParser::getForeignKeys() — the half of the FK-dependency-
+ * ordering fix that lives in the parser: extracting FK [parent, child] edges
+ * directly out of each CREATE TABLE statement as it is captured, so a table
+ * newly introduced by the backup (which has no information_schema constraint
+ * row on the target yet) still contributes an edge for TableRestorer's
+ * dependency sort. See TableRestorer's class docblock ("FK CAVEAT +
+ * DEPENDENCY ORDERING") for the full picture.
  */
 final class SqlDumpParserTest extends TestCase
 {
@@ -100,5 +108,112 @@ SQL;
         $blocks = $parser->finish();
 
         self::assertStringContainsString('CREATE TABLE `customers`', stream_get_contents($blocks['customers']));
+    }
+
+    public function test_extracts_fk_edge_from_a_create_table_statement(): void
+    {
+        $parser = new SqlDumpParser([]);
+        $parser->feed($this->dump([
+            'customers' => "CREATE TABLE `customers` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  PRIMARY KEY (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+            'orders' => "CREATE TABLE `orders` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  `customer_id` INT UNSIGNED NOT NULL,\n"
+                . "  PRIMARY KEY (`id`),\n"
+                . "  CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+        ]));
+
+        $parser->finish();
+
+        self::assertSame([['customers', 'orders']], $parser->getForeignKeys());
+    }
+
+    public function test_returns_no_edges_when_no_table_declares_a_foreign_key(): void
+    {
+        $parser = new SqlDumpParser([]);
+        $parser->feed($this->dump([
+            'widgets' => "CREATE TABLE `widgets` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  PRIMARY KEY (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+        ]));
+
+        $parser->finish();
+
+        self::assertSame([], $parser->getForeignKeys());
+    }
+
+    public function test_extracts_multiple_fk_edges_across_tables(): void
+    {
+        $parser = new SqlDumpParser([]);
+        $parser->feed($this->dump([
+            'widgets' => "CREATE TABLE `widgets` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  PRIMARY KEY (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+            'accessories' => "CREATE TABLE `accessories` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  `widget_id` INT UNSIGNED NOT NULL,\n"
+                . "  PRIMARY KEY (`id`),\n"
+                . "  CONSTRAINT `fk_accessories_widget` FOREIGN KEY (`widget_id`) REFERENCES `widgets` (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+            'reviews' => "CREATE TABLE `reviews` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  `widget_id` INT UNSIGNED NOT NULL,\n"
+                . "  PRIMARY KEY (`id`),\n"
+                . "  CONSTRAINT `fk_reviews_widget` FOREIGN KEY (`widget_id`) REFERENCES `widgets` (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+        ]));
+
+        $parser->finish();
+
+        self::assertSame(
+            [['widgets', 'accessories'], ['widgets', 'reviews']],
+            $parser->getForeignKeys(),
+        );
+    }
+
+    public function test_edges_are_scoped_to_a_single_parser_instance(): void
+    {
+        $withFk = new SqlDumpParser([]);
+        $withFk->feed($this->dump([
+            'orders' => "CREATE TABLE `orders` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  `customer_id` INT UNSIGNED NOT NULL,\n"
+                . "  PRIMARY KEY (`id`),\n"
+                . "  CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+        ]));
+        $withFk->finish();
+        self::assertNotSame([], $withFk->getForeignKeys());
+
+        $withoutFk = new SqlDumpParser([]);
+        $withoutFk->feed($this->dump([
+            'widgets' => "CREATE TABLE `widgets` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  PRIMARY KEY (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+        ]));
+        $withoutFk->finish();
+        self::assertSame([], $withoutFk->getForeignKeys());
+    }
+
+    /**
+     * Builds a minimal mysqldump-shaped string: a "Table structure" marker
+     * followed by the given CREATE TABLE body, for each table.
+     *
+     * @param array<string, string> $tables table_name => CREATE TABLE body
+     */
+    private function dump(array $tables): string
+    {
+        $sql = '';
+        foreach ($tables as $name => $createTableBody) {
+            $sql .= "-- Table structure for table `{$name}`\n" . $createTableBody;
+        }
+
+        return $sql;
     }
 }

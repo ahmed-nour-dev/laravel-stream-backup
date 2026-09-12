@@ -38,8 +38,11 @@ use Illuminate\Support\Facades\Log;
  * 3. No full decompressed dump ever exists in one place. Each chunk read
  *    from the decompressor's stdout is fed directly into the SqlDumpParser
  *    as it arrives — the parser routes lines into bounded per-table
- *    php://temp buffers on the fly. There is no intermediate buffer holding
- *    the whole decompressed dump, on disk or in memory.
+ *    php://temp buffers on the fly, also collecting FK [parent, child]
+ *    edges declared in each CREATE TABLE statement (getForeignKeys()) so a
+ *    table newly introduced by this backup still orders after a parent it
+ *    references. There is no intermediate buffer holding the whole
+ *    decompressed dump, on disk or in memory.
  *
  * 4. The TableRestorer executes inside a single DB transaction with
  *    FK checks disabled.
@@ -111,6 +114,7 @@ final class RestorePipeline
                 $parser,
             );
             $tableBlocks = $parser->finish();
+            $dumpFkEdges = $parser->getForeignKeys();
             Log::debug("[RestorePipeline] Decompression and parsing completed. Found " . count($tableBlocks) . " table blocks.");
 
             // Exclude the package's own tracking tables to prevent the
@@ -127,7 +131,7 @@ final class RestorePipeline
                 $onProgress(RestoreStatus::Importing);
             }
             Log::debug("[RestorePipeline] Handing over to TableRestorer...");
-            $result = $this->restorer->restore($tableBlocks, $context->connectionName, $startTime);
+            $result = $this->restorer->restore($tableBlocks, $context->connectionName, $startTime, $dumpFkEdges);
             Log::debug("[RestorePipeline] TableRestorer completed.");
             return $result;
         } catch (\Throwable $e) {
