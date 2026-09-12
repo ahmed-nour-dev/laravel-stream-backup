@@ -6,6 +6,11 @@ namespace Ahmednour\StreamBackup\DTOs;
 
 /**
  * Value object returned by the restore pipeline on success.
+ *
+ * $skippedStatements > 0 means the restore is a best-effort success (only
+ * possible when restore.skip_on_error is explicitly enabled): RunRestoreJob
+ * persists this as RestoreStatus::CompletedWithWarnings rather than
+ * Completed, so it is never mistaken for a fully clean restore.
  */
 final class RestoreResult
 {

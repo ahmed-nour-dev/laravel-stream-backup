@@ -186,6 +186,16 @@ php artisan backup:restore 123 --connection=staging
 
 Encrypted backups are automatically decrypted during restore using the configured encryption key.
 
+#### Restore error handling
+
+By default a restore is **fail-fast**: any SQL error aborts the whole run, rolls back every table processed so far (see the shadow-table rollback guarantee in [Architecture](#architecture)), and the `Restore` record is marked `failed`. A partially-restored database that looks successful unless you inspect warnings closely is worse than a loud failure.
+
+Set `STREAM_BACKUP_RESTORE_SKIP_ON_ERROR=true` (or `restore.skip_on_error` in the config) to opt into best-effort recovery instead: a statement that fails with one of `restore.skippable_error_codes` (default `[1227]`, the DEFINER/SUPER privilege error) is logged as a warning and the restore continues. A best-effort restore is never reported as indistinguishable from a clean one:
+
+- `RestoreResult::$skippedStatements` is greater than `0`.
+- The persisted `Restore` record's `status` is `completed_with_warnings` (not `completed`), and its `skipped_statements` column records the count.
+- The restore's rollback shadow tables (`_sbr_*`) are retained instead of dropped, so the last-known-good data survives for manual recovery.
+
 ### Custom Dump Drivers
 
 Register custom drivers in your `AppServiceProvider` or a package service provider:
@@ -292,6 +302,11 @@ php -r "echo base64_encode(random_bytes(32));"
 | `schedule.cleanup.time` | `03:15` | HH:MM (24h) for daily/weekly/monthly cleanup |
 | `schedule.stale_multipart.frequency` | `hourly` | Stale multipart abort cadence |
 | `schedule.stale_multipart.stale_hours` | `6` | Hours before a multipart upload is considered stale |
+| `restore.strip_definers` | `true` | Strips `DEFINER=` clauses from restored DDL (avoids error 1227 on managed MySQL) |
+| `restore.skip_on_error` | `false` | Fail-fast by default: any restore SQL error aborts the run. Set `true` to swallow `skippable_error_codes` and continue best-effort instead |
+| `restore.skippable_error_codes` | `[1227]` | MySQL error codes ignored when `skip_on_error` is `true`. Only used if `skip_on_error` is enabled |
+| `restore.atomic_restore` | `true` | Rename-aside shadow tables for cross-table rollback on failure |
+| `restore.exclude_tables` | `['backups', 'restores']` | Tables never touched by a restore, so the package's own tracking data survives |
 
 ## Architecture
 
