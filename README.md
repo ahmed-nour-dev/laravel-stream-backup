@@ -7,11 +7,11 @@
 
 > Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → transaction restores for Laravel 10+, with **constant memory use** regardless of database size.
 
-Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory`.
+Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore is currently MySQL-only**; see the [support matrix](#supported-databases) below.
 
 **Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. Nothing is ever buffered to disk and nothing exceeds the 32 MB part buffer in RAM, so a 300 GB database and a 3 GB database use roughly the same amount of memory.
 
-**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction, without buffering the backup file to disk.
+**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction, without buffering the backup file to disk. The parser understands `mysqldump` output only, so restore currently targets **MySQL backups**; restoring a PostgreSQL or SQLite dump is not supported (see [Roadmap](#roadmap)).
 
 This package is the productised form of the proof-of-concept script [`backup.php`](./backup.php).
 
@@ -28,7 +28,7 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 | **Local Disk Required** | Yes (>100% of DB size) | **No (Zero bytes)** |
 | **Memory Usage** | Variable | **Constant (~32 MB buffer)** |
 | **Encryption** | ❌ No built-in encryption | **AES-256-GCM or XChaCha20-Poly1305** |
-| **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports |
+| **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports (MySQL backups only) |
 | **Best For** | Small to medium databases | Large databases & multi-tenant setups |
 
 ---
@@ -56,12 +56,16 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 
 ## Supported Databases
 
-| Database   | Dump Tool    | Credential Handling | Notes |
-|---|---|---|---|
-| MySQL      | `mysqldump`  | Temp credential file (`--defaults-extra-file`) | Default; backward compatible |
-| PostgreSQL | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
-| SQLite     | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
-| Custom     | Your choice  | Your choice | Register via `DumperFactory::extend()` |
+**Backup and restore are not the same feature.** Backup (dump) supports MySQL, PostgreSQL, and SQLite. Restore currently only understands `mysqldump` output, so it supports MySQL backups only — restoring a PostgreSQL or SQLite backup is **not currently supported**.
+
+| Database   | Backup | Restore | Dump Tool    | Credential Handling | Notes |
+|---|---|---|---|---|---|
+| MySQL      | ✅ Yes | ✅ Yes | `mysqldump`  | Temp credential file (`--defaults-extra-file`) | Default; backward compatible |
+| PostgreSQL | ✅ Yes | ❌ Not currently supported | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
+| SQLite     | ✅ Yes | ❌ Not currently supported | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
+| Custom     | Your choice | ❌ Not supported | Your choice  | Your choice | Register via `DumperFactory::extend()` |
+
+PostgreSQL and SQLite restore support is tracked as follow-up work — see [Roadmap](#roadmap).
 
 ## Supported Destinations
 
@@ -95,6 +99,11 @@ STREAM_BACKUP_COMPRESSION_LEVEL=4
 STREAM_BACKUP_MAX_CONCURRENT=2
 STREAM_BACKUP_QUEUE_CONNECTION=redis
 STREAM_BACKUP_QUEUE=backups
+
+# Timeout safeguards — independent of Laravel's queue worker timeout
+# (RunBackupJob sets $timeout = 0). Set either to 0 to disable it.
+STREAM_BACKUP_MAX_RUNTIME=21600   # 6h ceiling on the whole backup
+STREAM_BACKUP_IDLE_TIMEOUT=900    # 15m with no pipeline progress = stalled
 
 # Database dump driver: 'auto' (default), 'mysql', 'pgsql', 'sqlite'
 STREAM_BACKUP_DUMP_DRIVER=auto
@@ -170,6 +179,8 @@ php artisan backup:cleanup                 # apply retention policy
 ```
 
 ### Restore
+
+> ⚠️ **MySQL only.** `backup:restore` parses `mysqldump` output; it does not currently support restoring PostgreSQL or SQLite backups, even though backup (dump) supports all three. See [Roadmap](#roadmap).
 
 You can restore a backup directly from any configured storage driver without downloading the entire file to disk.
 
@@ -326,6 +337,8 @@ php -r "echo base64_encode(random_bytes(32));"
 | `retention.monthly` | 6 | Monthly (last Sunday of month) backups kept |
 | `queue.max_concurrent` | 2 | Atomic semaphore cap across all workers |
 | `queue.slot_ttl` | 21 600 s | Per-slot lease; a crashed worker's slot auto-expires (6 h) |
+| `timeouts.max_runtime` | 21 600 s (6 h) | Hard ceiling on total backup runtime (dump+compress+upload). `0` disables it. Overridable per tenant via `tenants[].timeout` |
+| `timeouts.idle_timeout` | 900 s (15 m) | Aborts a backup that stops making forward progress (stalled dump/compressor/upload) even though the worker is still alive. `0` disables it |
 | `verify_after_upload` | `true` | Validates object size + gzip magic bytes after completion |
 | `auto_schedule` | `true` | Auto-register cleanup/stale-abort on Laravel scheduler |
 | `schedule.cleanup.frequency` | `daily` | Cleanup job cadence |
@@ -399,6 +412,24 @@ TableRestorer (runs inside a DB transaction)
 - **State-machine enum** (`BackupStatus`) with explicit `canTransitionTo()` guards every model transition.
 - **SIGTERM handling** with `pcntl_async_signals(true)` inside `RunBackupJob` — in-flight multipart uploads are aborted on graceful shutdown.
 - **Queue `$timeout = 0`** because backup runtime is determined by the DB, not by the worker.
+- **`TimeoutGuard`** enforces `timeouts.max_runtime` and `timeouts.idle_timeout` as safeguards that replace the disabled queue timeout — see [Timeouts](#timeouts) below.
+
+## Timeouts
+
+`RunBackupJob` deliberately sets Laravel's queue `$timeout` to `0` (unlimited) — a database dump can legitimately run for hours, and a worker timeout sized for typical jobs would `SIGKILL` it mid-stream, corrupting the object being uploaded. Instead, two independent, configurable safeguards bound how long a stuck backup can run:
+
+| Safeguard | Config key | Env var | Default | Detects |
+|---|---|---|---|---|
+| Max runtime | `timeouts.max_runtime` | `STREAM_BACKUP_MAX_RUNTIME` | 21 600 s (6 h) | Total backup time (dump + compress + encrypt + upload) exceeding a hard ceiling, even if it's still making progress |
+| Idle timeout | `timeouts.idle_timeout` | `STREAM_BACKUP_IDLE_TIMEOUT` | 900 s (15 m) | The pipeline stalling — no bytes read from the dump, written to the compressor, or read from the compressor — for that long, even though the worker process is still alive |
+
+Both are checked once per `stream_select()` iteration inside `StreamPipeline` (at most every ~200ms), the same polling cadence already used for SIGTERM cancellation. `max_runtime` is re-checked once more by `RunBackupJob` immediately after the pipeline finishes and before verification starts.
+
+- **Set either to `0`** to disable that particular safeguard. This is **not recommended**: a backup can then remain stuck indefinitely, bounded only by whatever eventually kills the queue worker (e.g. Supervisor, an OOM killer, a deploy).
+- **Per-tenant override**: `BackupContext::$timeoutSeconds` (populated from the `timeout` key of a `stream-backup.tenants` entry) overrides `max_runtime` for that tenant only — useful when one tenant's database is legitimately much larger than the rest.
+- **Which exception, which status**: exceeding either safeguard throws `MaxRuntimeExceededException` or `IdleTimeoutExceededException` (both extend `BackupTimeoutException extends PipelineException`), triggers the same cleanup as any other pipeline failure (multipart upload aborted, dump/compressor processes terminated), and marks the backup `BackupStatus::TimedOut` — distinct from a generic `Failed` so an operator can tell "the pipeline broke" apart from "the pipeline was too slow" at a glance.
+- **Interaction with the queue worker**: these safeguards are entirely independent of `--timeout` on `queue:work` (and of `$timeout` on the job itself, which stays `0`). Run backup workers with `--timeout=0` as `RunBackupJob` expects; if you must run them with a finite `--timeout` for other reasons, keep it comfortably above `max_runtime` — otherwise the worker's own SIGKILL fires first and you lose the graceful multipart-abort/process-cleanup these safeguards provide.
+- **Known limitation**: like the existing SIGTERM handling, these are cooperative checks — they cannot interrupt a single already-in-flight blocking call (e.g. one S3 `uploadPart()` on a wedged connection). They bound the time before the *next* such call is prevented, not an individual call already in progress. Configure your S3 client's own connect/read timeouts if you need a hard bound there too.
 
 ## Contracts / extension points
 
@@ -413,6 +444,10 @@ All of these are resolved from the container and can be swapped:
 - `DownloadDriver` — `S3DownloadDriver`, `SftpDownloadDriver`, or `LocalDownloadDriver`
 - `TenantResolver` — `ConfigTenantResolver` when `tenants` is populated, `SingleDatabaseResolver` otherwise
 - `BackupStream` — chunked non-blocking stream abstraction
+
+## Roadmap
+
+- **PostgreSQL and SQLite restore support** — `SqlDumpParser` currently only understands `mysqldump` output, so `backup:restore` is limited to MySQL backups. Extending the restore pipeline to parse `pg_dump` and `sqlite3 .dump` output is tracked in the project's [issue tracker](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues); backup (dump) already supports all three databases.
 
 ## Testing
 
@@ -448,6 +483,9 @@ Feature tests also cover `RunBackupJob` retry behavior: a failed attempt followe
 ### v1.4.0
 - Track backup attempts separately from the logical backup: `RunBackupJob` retries now share one `backups` row (matched via `attempt_group_id`) instead of creating an independent row per attempt
 - New `backup_attempts` table records per-attempt status, timing, failure reason, and multipart cleanup state
+- Configurable `timeouts.max_runtime` and `timeouts.idle_timeout` safeguards, independent of Laravel's queue worker timeout — see [Timeouts](#timeouts)
+- New `BackupStatus::TimedOut`-producing `MaxRuntimeExceededException` / `IdleTimeoutExceededException`, both cleaned up the same way as any other pipeline failure (multipart abort + process termination)
+- Per-tenant `timeout` override wired up via `BackupContext::$timeoutSeconds`
 
 ### v1.3.1
 - Dispatch cleanup jobs to configured queue and connection
