@@ -24,9 +24,15 @@ use Illuminate\Support\Facades\DB;
  *    and secondary index must survive the rename round-trip (InnoDB repoints
  *    child FK metadata to follow a parent RENAME — assert it lands back on the
  *    real table, not a dangling _sbr_* name).
- *  - Case B: a skippable statement (skip_on_error) leaves the restore
- *    known-incomplete, so the _sbr_* shadow must be RETAINED (not dropped)
- *    so the last-known-good data survives for manual recovery.
+ *  - Case B: a skippable statement, with skip_on_error EXPLICITLY enabled,
+ *    leaves the restore known-incomplete, so the _sbr_* shadow must be
+ *    RETAINED (not dropped) so the last-known-good data survives for manual
+ *    recovery.
+ *
+ * Plus a fail-fast-by-default regression test: with no skip_on_error
+ * override at all, a statement error that would otherwise match
+ * skippable_error_codes must still abort and roll back — restore.skip_on_error
+ * defaults to false (see config/stream-backup.php).
  */
 final class RestoreRollbackTest extends TestCase
 {
@@ -202,7 +208,7 @@ final class RestoreRollbackTest extends TestCase
         self::assertTrue($enforced, 'FK must be enforced (reject a dangling customer_id) after rollback.');
     }
 
-    public function test_case_b_skip_on_error_retains_shadow_tables_for_manual_recovery(): void
+    public function test_default_skip_on_error_is_false_and_fails_fast_even_for_a_configured_skippable_code(): void
     {
         $this->skipUnlessMysqlAvailable();
         $this->cleanSchema();
@@ -218,9 +224,84 @@ final class RestoreRollbackTest extends TestCase
         ) ENGINE=InnoDB');
         $db->insert('INSERT INTO `widgets` (`id`, `sku`) VALUES (?, ?)', [1, 'ORIGINAL-SKU']);
 
-        // Make duplicate-key (1062) a SKIPPABLE error for this run only, so
-        // the skip-on-error path can be exercised deterministically without
-        // the SUPER/DEFINER (1227) privilege dance.
+        // Duplicate-key (1062) is in skippable_error_codes, but skip_on_error
+        // itself is left at its default (false, per config/stream-backup.php)
+        // — the error must still be fatal. This is the core acceptance
+        // criterion: a restore SQL error fails by default regardless of
+        // which codes skippable_error_codes lists.
+        $this->app['config']->set('stream-backup.restore.skippable_error_codes', [1062]);
+        self::assertFalse(
+            (bool) $this->app['config']->get('stream-backup.restore.skip_on_error'),
+            'Precondition: skip_on_error must default to false.'
+        );
+
+        $widgetsBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `widgets`;\n"
+            . "CREATE TABLE `widgets` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `sku` VARCHAR(50) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`),\n"
+            . "  UNIQUE KEY `uk_widgets_sku` (`sku`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `widgets` (`id`, `sku`) VALUES (1, 'RESTORED-SKU');\n"
+            // Duplicate primary key (id=1) → MySQL error 1062. Skippable by
+            // code, but skip_on_error=false means it must throw instead of
+            // being swallowed.
+            . "INSERT INTO `widgets` (`id`, `sku`) VALUES (1, 'DUP-SKU');\n"
+        );
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        try {
+            $restorer->restore(
+                ['widgets' => $widgetsBlock],
+                'mysql_test',
+                microtime(true),
+            );
+            self::fail('Expected RestoreFailedException: skip_on_error defaults to false.');
+        } catch (RestoreFailedException $e) {
+            // Expected: fail-fast by default.
+        }
+
+        // Rollback must have fired: the original survives under its real
+        // name, and no _sbr_* shadow is left behind (this is a genuine
+        // failure, not a known-incomplete best-effort success).
+        $widget = $db->selectOne('SELECT `sku` FROM `widgets` WHERE `id` = 1');
+        self::assertNotNull($widget, 'widgets must exist after rollback');
+        self::assertSame('ORIGINAL-SKU', $widget->sku);
+
+        $shadows = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.tables '
+            . 'WHERE table_schema = DATABASE() '
+            . 'AND table_name LIKE CONCAT(?, ?, ?)',
+            ['_', 'sbr_', '%']
+        );
+        self::assertNotNull($shadows);
+        self::assertSame(0, (int) $shadows->n, 'No _sbr_* shadow tables should remain after a fail-fast rollback.');
+    }
+
+    public function test_case_b_explicit_skip_on_error_retains_shadow_tables_for_manual_recovery(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        // Original data to protect.
+        $db->unprepared('CREATE TABLE `widgets` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `sku` VARCHAR(50) NOT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_widgets_sku` (`sku`)
+        ) ENGINE=InnoDB');
+        $db->insert('INSERT INTO `widgets` (`id`, `sku`) VALUES (?, ?)', [1, 'ORIGINAL-SKU']);
+
+        // Explicitly opt into best-effort mode — skip_on_error now defaults
+        // to false, so this test must turn it on itself. Also make
+        // duplicate-key (1062) a SKIPPABLE error for this run only, so the
+        // skip-on-error path can be exercised deterministically without the
+        // SUPER/DEFINER (1227) privilege dance.
+        $this->app['config']->set('stream-backup.restore.skip_on_error', true);
         $this->app['config']->set('stream-backup.restore.skippable_error_codes', [1062]);
 
         $widgetsBlock = $this->buffer(

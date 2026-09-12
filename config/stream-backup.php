@@ -255,19 +255,31 @@ return [
     |   When true, DEFINER= clauses are stripped from DDL statements before
     |   execution so the object is created with the restore user as definer.
     |
-    | skip_on_error: when true, a statement that fails with one of the
-    |   skippable_error_codes is logged as a warning and the restore continues
-    |   instead of aborting the whole (potentially long) run.
+    | skip_on_error: defaults to false — a restore SQL error is FATAL and
+    |   aborts the whole run (see TableRestorer's ROLLBACK GUARANTEE: the
+    |   shadow tables are rolled back and a RestoreFailedException is
+    |   thrown). A partially-restored database that looks successful unless
+    |   you inspect warnings closely is worse than a loud failure for a
+    |   backup/restore system.
+    |
+    |   Set to true to opt back into best-effort mode: a statement that fails
+    |   with one of the skippable_error_codes is logged as a warning and the
+    |   restore continues instead of aborting. Use this only for recovery
+    |   scenarios where a partial restore is acceptable — the resulting
+    |   restore is reported as best-effort (skipped_statements > 0 on the
+    |   RestoreResult, and the persisted Restore record's status is
+    |   `completed_with_warnings` instead of `completed`) so it is never
+    |   confused with a fully clean restore.
     |
     | skippable_error_codes: MySQL driver-specific error codes (not the
-    |   SQLSTATE) considered safe to skip. 1227 = access denied for
-    |   DEFINER/SUPER. Keep this list to privilege/DDL codes only — adding DML
-    |   error codes here can silently lose data.
+    |   SQLSTATE) considered safe to skip when skip_on_error is true. 1227 =
+    |   access denied for DEFINER/SUPER. Keep this list to privilege/DDL
+    |   codes only — adding DML error codes here can silently lose data.
     |
     */
     'restore' => [
         'strip_definers'        => env('STREAM_BACKUP_RESTORE_STRIP_DEFINERS', true),
-        'skip_on_error'         => env('STREAM_BACKUP_RESTORE_SKIP_ON_ERROR', true),
+        'skip_on_error'         => env('STREAM_BACKUP_RESTORE_SKIP_ON_ERROR', false),
         'skippable_error_codes' => [1227],
 
         // Atomic restore via rename-aside "shadow" tables. Each existing

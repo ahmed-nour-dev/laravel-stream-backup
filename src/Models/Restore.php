@@ -24,6 +24,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property array|null              $tables_restored
  * @property RestoreStatus           $status
  * @property int|null                $rows_affected
+ * @property int                     $skipped_statements
  * @property \Illuminate\Support\Carbon|null $started_at
  * @property \Illuminate\Support\Carbon|null $finished_at
  * @property int|null                $duration
@@ -36,13 +37,14 @@ class Restore extends Model
     protected $guarded = [];
 
     protected $casts = [
-        'status'           => RestoreStatus::class,
-        'tables_requested' => 'array',
-        'tables_restored'  => 'array',
-        'rows_affected'    => 'int',
-        'started_at'       => 'datetime',
-        'finished_at'      => 'datetime',
-        'duration'         => 'int',
+        'status'              => RestoreStatus::class,
+        'tables_requested'    => 'array',
+        'tables_restored'     => 'array',
+        'rows_affected'       => 'int',
+        'skipped_statements'  => 'int',
+        'started_at'          => 'datetime',
+        'finished_at'         => 'datetime',
+        'duration'            => 'int',
     ];
 
     public function backup(): BelongsTo

@@ -121,11 +121,20 @@ class RunRestoreJob implements ShouldQueue
                 // Best effort — the connection might already be broken.
             }
 
-            $this->restoreRecord->markAs(RestoreStatus::Completed, [
-                'tables_restored' => $result->tablesRestored,
-                'rows_affected'   => $result->totalRowsAffected,
-                'finished_at'     => now(),
-                'duration'        => (int) ceil($result->durationSeconds),
+            // A restore that swallowed skippable SQL errors (skip_on_error
+            // opt-in) is known-incomplete: it must never be recorded as an
+            // indistinguishable Completed status alongside a fully clean
+            // restore. See RestoreStatus::CompletedWithWarnings.
+            $completionStatus = $result->skippedStatements > 0
+                ? RestoreStatus::CompletedWithWarnings
+                : RestoreStatus::Completed;
+
+            $this->restoreRecord->markAs($completionStatus, [
+                'tables_restored'     => $result->tablesRestored,
+                'rows_affected'       => $result->totalRowsAffected,
+                'skipped_statements'  => $result->skippedStatements,
+                'finished_at'         => now(),
+                'duration'            => (int) ceil($result->durationSeconds),
             ]);
 
             event(new RestoreSuccessful($this->context, $this->restoreRecord, $result));
