@@ -124,6 +124,13 @@ return [
     | count well under the 10,000 limit even for 300 GB databases while
     | minimising HTTP round-trips.
     |
+    | NOTE: each part is accumulated in a php://temp buffer before upload.
+    | php://temp holds up to 2 MB in memory and transparently spills the
+    | rest to a real temp file on disk, so part_size also bounds the small,
+    | constant amount of scratch disk space the backup pipeline can use —
+    | it is not literally zero bytes. See "Temporary Disk Usage" in the
+    | README for the full picture, including restore-side buffering.
+    |
     | read_chunk: bytes pulled from each pipe per stream_select iteration.
     |
     */
