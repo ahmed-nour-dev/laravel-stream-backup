@@ -495,6 +495,23 @@ The feature test `StreamPipelineSmokeTest` is auto-skipped unless a dump tool + 
 
 Feature tests also cover `RunBackupJob` retry behavior: a failed attempt followed by a successful retry must share one `backups` row and produce two `backup_attempts` rows (`RunBackupJobAttemptTrackingTest`).
 
+### Integration tests
+
+`tests/Integration` is a separate PHPUnit testsuite that exercises the dump and destination drivers against real services rather than mocks — `pg_dump` and `sqlite3` for the database drivers, and an S3-compatible endpoint (MinIO) and a real SFTP server for the destination drivers, covering both unencrypted and `openssl-aes-256-gcm`-encrypted streaming paths and the post-upload checksum/verification step. It is intentionally excluded from a plain `vendor/bin/phpunit` run (which stays pinned to `Unit,Feature`, same as CI's fast matrix) and from the fast matrix's `tests.yml` workflow; it runs as its own `integration` GitHub Actions job against ephemeral service containers, and is entirely skipped locally unless the relevant binaries/env vars are present:
+
+```bash
+vendor/bin/phpunit --testsuite Integration
+```
+
+| Driver | Env vars |
+| --- | --- |
+| PostgreSQL (`pg_dump` on PATH) | `STREAM_BACKUP_TEST_PGSQL_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` |
+| SQLite (`sqlite3` on PATH) | none — uses a throwaway temp file |
+| S3-compatible / MinIO (`sqlite3` + `gzip` on PATH) | `STREAM_BACKUP_TEST_S3_ENDPOINT` / `_KEY` / `_SECRET` / `_BUCKET` / `_REGION` |
+| SFTP (`sqlite3` + `gzip` on PATH) | `STREAM_BACKUP_TEST_SFTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_ROOT` |
+
+MySQL dump + restore integration coverage already lives in the fast matrix (`tests.yml`) against a real `mysql:8.0` service — see `STREAM_BACKUP_TEST_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` above.
+
 ## Changelog
 
 ### v1.5.0

@@ -1,0 +1,132 @@
+name: integration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    name: Integration (PostgreSQL, SQLite, S3-compatible, SFTP)
+
+    # A single PHP/Laravel pairing — this job's cost is dominated by the
+    # service containers below, not by PHP-version coverage (that's what the
+    # `tests` workflow's matrix is for). Keeping it out of that matrix means
+    # adding a database or destination here never multiplies CI time by the
+    # number of supported PHP/Laravel combinations.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stream_backup_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      sftp:
+        image: atmoz/sftp:latest
+        env:
+          SFTP_USERS: testuser:testpass:1001:1001:upload
+        ports:
+          - 2222:22
+
+    env:
+      STREAM_BACKUP_TEST_PGSQL_HOST: 127.0.0.1
+      STREAM_BACKUP_TEST_PGSQL_PORT: 5432
+      STREAM_BACKUP_TEST_PGSQL_USER: postgres
+      STREAM_BACKUP_TEST_PGSQL_PASSWORD: postgres
+      STREAM_BACKUP_TEST_PGSQL_DATABASE: stream_backup_test
+
+      STREAM_BACKUP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      STREAM_BACKUP_TEST_S3_KEY: minioadmin
+      STREAM_BACKUP_TEST_S3_SECRET: minioadmin123
+      STREAM_BACKUP_TEST_S3_BUCKET: stream-backup-test
+      STREAM_BACKUP_TEST_S3_REGION: us-east-1
+
+      STREAM_BACKUP_TEST_SFTP_HOST: 127.0.0.1
+      STREAM_BACKUP_TEST_SFTP_PORT: 2222
+      STREAM_BACKUP_TEST_SFTP_USER: testuser
+      STREAM_BACKUP_TEST_SFTP_PASSWORD: testpass
+      STREAM_BACKUP_TEST_SFTP_ROOT: upload
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gzip sqlite3 postgresql-client
+
+      # MinIO needs a `server /data` command, which the `services:` block
+      # above has no way to supply (it can only set image/env/ports) — so it
+      # runs as a plain background container instead of a GitHub Actions
+      # service. The test bucket isn't pre-created here; S3CompatibleIntegrationTest
+      # creates it itself on first use, so this works against any bare MinIO.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin123 \
+            quay.io/minio/minio:latest server /data
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pcntl, hash, mbstring, pdo, pdo_sqlite, sqlite3, pdo_pgsql, pgsql, intl, bcmath
+          coverage: none
+          tools: composer:v2
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5432 -U postgres && break
+            sleep 2
+          done
+          pg_isready -h 127.0.0.1 -p 5432 -U postgres
+
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:9000/minio/health/live
+
+      - name: Wait for SFTP
+        run: |
+          for i in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null && exec 3<&- && break
+            sleep 2
+          done
+          (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null && exec 3<&-
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-integration-php-8.3-${{ hashFiles('**/composer.json') }}
+          restore-keys: |
+            ${{ runner.os }}-integration-php-8.3-
+
+      - name: Install dependencies
+        run: |
+          composer require --dev "illuminate/contracts:^12.0" "orchestra/testbench:^10.0" --no-interaction --no-update
+          composer update --prefer-stable --prefer-dist --no-interaction --no-progress
+
+      - name: Execute integration tests
+        run: vendor/bin/phpunit --testsuite Integration --colors=always
