@@ -127,7 +127,13 @@ final class SftpIntegrationTest extends TestCase
 
         $context = new BackupContext(
             tenantId:       null,
-            databaseName:   'sbr_sftp_it_db',
+            // Distinct databaseName from the round-trip tests above/below:
+            // BackupPathBuilder's path only has second-level timestamp
+            // precision, and SftpChunkedUploader::initiate() opens the
+            // remote path with SFTP::RESUME (append, not truncate) — two
+            // tests landing on the identical path in the same second would
+            // silently concatenate their content instead of overwriting it.
+            databaseName:   'sbr_sftp_it_db_checksum_match',
             connectionName: 'sqlite_sftp_it',
             disk:           'sftp_unused',
             driver:         'sqlite',
@@ -151,7 +157,7 @@ final class SftpIntegrationTest extends TestCase
 
         $context = new BackupContext(
             tenantId:       null,
-            databaseName:   'sbr_sftp_it_db',
+            databaseName:   'sbr_sftp_it_db_checksum_mismatch',
             connectionName: 'sqlite_sftp_it',
             disk:           'sftp_unused',
             driver:         'sqlite',

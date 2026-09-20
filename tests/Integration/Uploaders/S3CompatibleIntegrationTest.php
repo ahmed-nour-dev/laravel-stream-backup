@@ -129,7 +129,11 @@ final class S3CompatibleIntegrationTest extends TestCase
 
         $context = new BackupContext(
             tenantId:       null,
-            databaseName:   'sbr_s3_it_db',
+            // Distinct databaseName from the round-trip tests above/below:
+            // BackupPathBuilder's path only has second-level timestamp
+            // precision, so reusing the same name risks two tests in this
+            // file landing on the identical remote path.
+            databaseName:   'sbr_s3_it_db_checksum_match',
             connectionName: 'sqlite_s3_it',
             disk:           's3',
             driver:         'sqlite',
@@ -153,7 +157,7 @@ final class S3CompatibleIntegrationTest extends TestCase
 
         $context = new BackupContext(
             tenantId:       null,
-            databaseName:   'sbr_s3_it_db',
+            databaseName:   'sbr_s3_it_db_checksum_mismatch',
             connectionName: 'sqlite_s3_it',
             disk:           's3',
             driver:         'sqlite',
