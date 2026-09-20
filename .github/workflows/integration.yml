@@ -31,19 +31,6 @@ jobs:
           --health-timeout=5s
           --health-retries=10
 
-      # bitnami/minio boots `minio server` from env vars alone, which lets it
-      # run as a plain GitHub Actions service (the upstream minio/minio image
-      # requires a `server /data` command override that the `services:` block
-      # cannot supply). MINIO_DEFAULT_BUCKETS pre-creates the test bucket.
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin123
-          MINIO_DEFAULT_BUCKETS: stream-backup-test
-        ports:
-          - 9000:9000
-
       sftp:
         image: atmoz/sftp:latest
         env:
@@ -78,6 +65,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gzip sqlite3 postgresql-client
+
+      # MinIO needs a `server /data` command, which the `services:` block
+      # above has no way to supply (it can only set image/env/ports) — so it
+      # runs as a plain background container instead of a GitHub Actions
+      # service. The test bucket isn't pre-created here; S3CompatibleIntegrationTest
+      # creates it itself on first use, so this works against any bare MinIO.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin123 \
+            quay.io/minio/minio:latest server /data
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
