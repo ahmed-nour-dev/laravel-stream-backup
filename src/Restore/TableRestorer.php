@@ -60,10 +60,26 @@ use Illuminate\Support\Facades\Log;
  * it, but its FK is right there in the CREATE TABLE text. Dump order is
  * preserved for tables with no FK relationship in either source.
  *
- * Remaining caveat: a SELECTIVE restore of a table that is an FK parent of a
- * table NOT included in the restore still repoints the unrestored child's FK
- * to `_sbr_*`, which is dropped on success → orphaned FK metadata. Disable
- * `restore.atomic_restore` to opt out of shadow tables entirely.
+ * SELECTIVE RESTORE FK-BOUNDARY GUARD
+ * ------------------------------------
+ * A selective restore of a table that is an FK parent of a table NOT
+ * included in the restore would repoint the unrestored child's FK to
+ * `_sbr_*`, which is dropped on success → permanently orphaned FK metadata.
+ * The same risk exists in reverse (a restored child whose FK references an
+ * unrestored parent) and for tables that mutually reference each other
+ * across the boundary. Rather than attempt to reason about which direction
+ * is actually safe under shadow-table replacement, `assertNoForeignKeyBoundaryViolations()`
+ * fails fast, before any destructive work, whenever a requested table has
+ * ANY foreign-key relationship — as parent or child — with a table outside
+ * the restore set. The dependency graph is read from both the live schema
+ * (information_schema.referential_constraints) and the dump's own declared
+ * FKs (SqlDumpParser::getForeignKeys(), which now covers every table in the
+ * dump, not only ones being restored, so a live child excluded from the
+ * restore is still visible even on a target where it doesn't exist yet).
+ * Disable `restore.atomic_restore` to opt out of shadow tables entirely — the
+ * boundary guard still applies, since a plain (non-shadow) selective restore
+ * is not immune to the underlying DROP+CREATE re-pointing children's FKs
+ * either.
  *
  * SKIP-ON-ERROR INTERACTION
  * -------------------------
@@ -127,13 +143,22 @@ final class TableRestorer
      *                                              merged with the existing-schema graph so a table
      *                                              newly introduced by this restore still orders
      *                                              after a parent it references.
+     * @param bool                                  $selective   True when $tableBlocks represents a
+     *                                              caller-requested subset of tables rather than a
+     *                                              full restore. Only then is the FK restore-boundary
+     *                                              guard run — a full restore has no "outside the
+     *                                              set" tables to worry about by definition, and must
+     *                                              keep working unchanged.
      * @return RestoreResult
      *
-     * @throws RestoreFailedException If any SQL execution fails, or if stale
+     * @throws RestoreFailedException If any SQL execution fails, if stale
      *                                shadow tables from a previous crashed
-     *                                restore are detected.
+     *                                restore are detected, or if a selective
+     *                                restore's tables have a foreign-key
+     *                                relationship crossing the restore
+     *                                boundary.
      */
-    public function restore(array $tableBlocks, string $connection, float $startTime, array $dumpFkEdges = []): RestoreResult
+    public function restore(array $tableBlocks, string $connection, float $startTime, array $dumpFkEdges = [], bool $selective = false): RestoreResult
     {
         $db = DB::connection($connection);
         $totalRows      = 0;
@@ -158,6 +183,10 @@ final class TableRestorer
             }
 
             $this->assertNoStaleShadows($db);
+
+            if ($selective) {
+                $this->assertNoForeignKeyBoundaryViolations($db, array_keys($tableBlocks), $dumpFkEdges);
+            }
 
             $this->execSql($db, 'SET FOREIGN_KEY_CHECKS = 0');
             Log::info('[Restore] Disabled foreign key checks.');
@@ -628,6 +657,144 @@ final class TableRestorer
         }
 
         return $edges;
+    }
+
+    /**
+     * Fail fast, before any destructive work, if a selective restore's
+     * tables have a foreign-key relationship — as parent or child — with a
+     * table outside the requested restore set. See the class docblock's
+     * "SELECTIVE RESTORE FK-BOUNDARY GUARD" section for the rationale.
+     *
+     * @param string[]                                 $tables      The restore set (array_keys($tableBlocks)).
+     * @param array<int, array{0: string, 1: string}>  $dumpFkEdges FK edges parsed out of the dump (SqlDumpParser::getForeignKeys()).
+     *
+     * @throws RestoreFailedException If a cross-boundary relationship is found.
+     */
+    private function assertNoForeignKeyBoundaryViolations(ConnectionInterface $db, array $tables, array $dumpFkEdges): void
+    {
+        if ($tables === []) {
+            return;
+        }
+
+        $violations = self::findForeignKeyBoundaryViolations(
+            $tables,
+            $this->liveForeignKeyEdgesTouching($db, $tables),
+            $dumpFkEdges,
+        );
+
+        if ($violations === []) {
+            return;
+        }
+
+        throw new RestoreFailedException(self::formatForeignKeyBoundaryError($tables, $violations));
+    }
+
+    /**
+     * FK parent→child edges, as they exist in the target schema right now,
+     * where AT LEAST ONE endpoint is in $tables — i.e. every live FK that
+     * could possibly cross the restore boundary. Unlike fkEdges() (used for
+     * dependency ordering), this deliberately does NOT require both
+     * endpoints to be in $tables: an edge with exactly one endpoint inside
+     * the set is precisely the cross-boundary case the guard is looking for.
+     *
+     * @param string[] $tables
+     * @return array<int, array{0: string, 1: string}> list of [parent, child]
+     */
+    private function liveForeignKeyEdgesTouching(ConnectionInterface $db, array $tables): array
+    {
+        $placeholders = implode(',', array_fill(0, count($tables), '?'));
+
+        $rows = $db->select(
+            'SELECT referenced_table_name AS parent, table_name AS child '
+            . 'FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() '
+            . "AND (referenced_table_name IN ({$placeholders}) OR table_name IN ({$placeholders}))",
+            array_merge($tables, $tables),
+            false,
+        );
+
+        $edges = [];
+        foreach ($rows as $row) {
+            $parent = is_object($row) && isset($row->parent) ? (string) $row->parent : '';
+            $child  = is_object($row) && isset($row->child) ? (string) $row->child : '';
+
+            if ($parent !== '' && $child !== '') {
+                $edges[] = [$parent, $child];
+            }
+        }
+
+        return $edges;
+    }
+
+    /**
+     * Pure (no DB) core of the FK restore-boundary guard: merges live-schema
+     * edges with dump-declared edges and returns the deduplicated [parent,
+     * child] pairs that cross the restore boundary — i.e. exactly one
+     * endpoint is in $tables. An edge with both endpoints inside the set is
+     * dependency-closed (safe); an edge with both endpoints outside is
+     * irrelevant to this restore; a self-reference imposes no boundary.
+     * Directly unit-testable, same style as orderTables()/filterEdgesToTableSet().
+     *
+     * @param string[]                                 $tables
+     * @param array<int, array{0: string, 1: string}>  $liveEdges
+     * @param array<int, array{0: string, 1: string}>  $dumpFkEdges
+     * @return array<int, array{0: string, 1: string}> deduplicated [parent, child] violations
+     */
+    public static function findForeignKeyBoundaryViolations(array $tables, array $liveEdges, array $dumpFkEdges): array
+    {
+        if ($tables === []) {
+            return [];
+        }
+
+        $set = array_flip($tables);
+        $violations = [];
+
+        foreach (array_merge($liveEdges, $dumpFkEdges) as [$parent, $child]) {
+            if ($parent === $child) {
+                continue;
+            }
+
+            $parentIn = isset($set[$parent]);
+            $childIn  = isset($set[$child]);
+
+            if ($parentIn === $childIn) {
+                // Both inside (dependency-closed) or both outside (irrelevant).
+                continue;
+            }
+
+            $violations["{$parent}\0{$child}"] = [$parent, $child];
+        }
+
+        return array_values($violations);
+    }
+
+    /**
+     * Render a clear, actionable error naming every table involved in a
+     * cross-boundary FK relationship and which side of it falls outside the
+     * requested restore set.
+     *
+     * @param string[]                                 $tables     The requested restore set.
+     * @param array<int, array{0: string, 1: string}>  $violations As returned by findForeignKeyBoundaryViolations().
+     */
+    private static function formatForeignKeyBoundaryError(array $tables, array $violations): string
+    {
+        $set = array_flip($tables);
+        $lines = [];
+
+        foreach ($violations as [$parent, $child]) {
+            $lines[] = isset($set[$parent])
+                ? "`{$parent}` (requested) is referenced by a foreign key on `{$child}` (not requested)"
+                : "`{$child}` (requested) has a foreign key referencing `{$parent}` (not requested)";
+        }
+
+        return sprintf(
+            'Selective restore aborted: the requested tables (%s) have a foreign-key '
+            . 'relationship crossing the restore boundary: %s. Include the related '
+            . 'table(s) in the restore, or remove the foreign key, before retrying. '
+            . '(A future version may support automatic dependency closure.)',
+            implode(', ', array_map(static fn (string $t): string => "`{$t}`", $tables)),
+            implode('; ', $lines),
+        );
     }
 
     /**

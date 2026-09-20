@@ -68,6 +68,19 @@ final class SqlDumpParser
     /** The table we're currently capturing (null = skip). */
     private ?string $currentTable = null;
 
+    /**
+     * The table whose CREATE TABLE section is currently streaming past,
+     * regardless of whether it is being captured into a buffer. Unlike
+     * $currentTable, this is set for EVERY table (including ones excluded
+     * from a selective restore) so getForeignKeys() can see an FK declared
+     * by a table the restore is NOT touching — e.g. a live child table that
+     * references a table the caller IS restoring. TableRestorer's boundary
+     * guard needs that edge to detect the cross-boundary relationship even
+     * when information_schema has no row for it yet (a brand-new table on a
+     * fresh target).
+     */
+    private ?string $fkScanTable = null;
+
     /** Whether we found at least one table marker so far. */
     private bool $foundAnyTable = false;
 
@@ -77,10 +90,14 @@ final class SqlDumpParser
     private bool $finished = false;
 
     /**
-     * FK [parent, child] edges parsed directly out of the CREATE TABLE
-     * statements captured while feeding this parser. Populated regardless of
-     * whether the referenced (parent) table itself is one of the requested
-     * tables — TableRestorer filters edges to its restore set.
+     * FK [parent, child] edges parsed directly out of every CREATE TABLE
+     * statement seen while feeding this parser — including tables excluded
+     * from a selective restore, not only ones captured into a buffer.
+     * Populated regardless of whether either endpoint is one of the
+     * requested tables; consumers filter edges down to their own set
+     * (TableRestorer::filterEdgesToTableSet() for dependency ordering,
+     * TableRestorer::findForeignKeyBoundaryViolations() for the
+     * cross-boundary safety guard).
      *
      * @var array<int, array{0: string, 1: string}>
      */
@@ -182,6 +199,7 @@ final class SqlDumpParser
         if (preg_match(self::TABLE_STRUCTURE_PATTERN, $trimmedLine, $matches) === 1) {
             $tableName = $matches[1];
             $this->foundAnyTable = true;
+            $this->fkScanTable = $tableName;
 
             if ($this->selectAll || isset($this->requestedLookup[$tableName])) {
                 $this->currentTable = $tableName;
@@ -218,16 +236,16 @@ final class SqlDumpParser
             }
         }
 
+        // Capture FK edges straight out of the CREATE TABLE text, for EVERY
+        // table (not only ones being captured into a buffer) — see
+        // $fkScanTable's docblock for why a skipped table's own FK
+        // declaration still matters.
+        if ($this->fkScanTable !== null && preg_match(self::FOREIGN_KEY_PATTERN, $line, $fkMatches) === 1) {
+            $this->foreignKeys[] = [$fkMatches[1], $this->fkScanTable];
+        }
+
         // Write the current line to the active table's buffer.
         if ($this->currentTable !== null && isset($this->buffers[$this->currentTable])) {
-            // Capture FK edges straight out of the CREATE TABLE text so
-            // that a table newly introduced by this backup (which has no
-            // information_schema constraint row yet on the target) still
-            // contributes an edge to TableRestorer's dependency sort.
-            if (preg_match(self::FOREIGN_KEY_PATTERN, $line, $fkMatches) === 1) {
-                $this->foreignKeys[] = [$fkMatches[1], $this->currentTable];
-            }
-
             fwrite($this->buffers[$this->currentTable], $line);
         }
     }
@@ -242,13 +260,16 @@ final class SqlDumpParser
     }
 
     /**
-     * FK [parent, child] edges parsed directly out of the CREATE TABLE
-     * statements captured while feeding this parser.
+     * FK [parent, child] edges parsed directly out of every CREATE TABLE
+     * statement seen while feeding this parser, whether or not that table
+     * was captured into a buffer.
      *
      * Unlike information_schema (which only knows about constraints that
      * already exist on the target), this reflects the dump's OWN declared
      * FKs — including a table the dump is introducing for the first time, so
-     * TableRestorer's dependency sort can still order it after its parent.
+     * TableRestorer's dependency sort can still order it after its parent,
+     * and a table excluded from a selective restore whose FK still crosses
+     * into the requested set, so TableRestorer's boundary guard can catch it.
      *
      * @return array<int, array{0: string, 1: string}> list of [parent, child]
      */
