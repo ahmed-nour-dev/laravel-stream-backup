@@ -277,6 +277,41 @@ return [
     'auto_schedule'       => env('STREAM_BACKUP_AUTO_SCHEDULE', true),
     'verify_after_upload' => true,
 
+    /*
+    |--------------------------------------------------------------------------
+    | Full checksum verification (optional)
+    |--------------------------------------------------------------------------
+    |
+    | verify_after_upload above is a cheap sanity check: the object exists,
+    | its size matches, and its first few bytes look right (gzip magic /
+    | encryption version byte). It does NOT prove every byte of the remote
+    | object matches what was actually streamed.
+    |
+    | Setting this to true adds a stronger check, run after verify_after_upload's
+    | checks pass: the SHA-256 checksum ChecksumStream recorded while the
+    | compressed/encrypted bytes were being uploaded is compared against the
+    | remote object's actual content.
+    |
+    |   - S3 (and S3-compatible) destinations: a server-side full-object
+    |     SHA-256 checksum is used when the provider returns one, at the
+    |     cost of one extra HeadObject call and no download. Most
+    |     S3-compatible providers don't expose this for multipart uploads
+    |     (see BackupVerifier), so treat this as a best-effort fast path,
+    |     not a guarantee.
+    |   - Whenever a provider-side checksum isn't available — SFTP, local
+    |     disk, or an S3-compatible provider without one — the remote
+    |     object is streamed back and hashed in bounded-memory chunks
+    |     instead of being buffered whole.
+    |
+    | This means large backups may download the WHOLE object a second time
+    | whenever the fast path isn't available — real bandwidth/time cost for
+    | large databases — which is why this defaults to false and only has
+    | any effect when verify_after_upload is also true. A mismatch fails
+    | the backup exactly like a size or magic-byte mismatch does.
+    |
+    */
+    'full_checksum_verification' => env('STREAM_BACKUP_FULL_CHECKSUM_VERIFICATION', false),
+
     'schedule' => [
         'timezone'   => env('STREAM_BACKUP_SCHEDULE_TZ'),
         'connection' => env('STREAM_BACKUP_CLEANUP_CONNECTION'),

@@ -6,6 +6,7 @@ namespace Ahmednour\StreamBackup\Tests\Integration\Uploaders;
 
 use Ahmednour\StreamBackup\DTOs\BackupContext;
 use Ahmednour\StreamBackup\Enums\BackupStatus;
+use Ahmednour\StreamBackup\Support\BackupVerifier;
 use Ahmednour\StreamBackup\Tests\Support\BuildsIntegrationBackups;
 use Ahmednour\StreamBackup\Tests\TestCase;
 use Aws\S3\S3ClientInterface;
@@ -112,6 +113,61 @@ final class S3CompatibleIntegrationTest extends TestCase
 
         $plaintext = $this->downloadAndDecompress($backup);
         self::assertStringContainsString('sbr-s3-round-trip-marker', $plaintext);
+    }
+
+    /**
+     * Full checksum verification is opt-in and off by default — this proves
+     * that with it enabled, a real backup against a real S3-compatible
+     * service still passes: whichever path BackupVerifier takes (a
+     * server-side full-object checksum if MinIO ever returns one, or the
+     * streaming-download fallback otherwise), the content it verifies
+     * against is exactly what ChecksumStream recorded during upload.
+     */
+    public function test_full_checksum_verification_passes_against_a_real_s3_compatible_service(): void
+    {
+        $this->app['config']->set('stream-backup.full_checksum_verification', true);
+
+        $context = new BackupContext(
+            tenantId:       null,
+            databaseName:   'sbr_s3_it_db',
+            connectionName: 'sqlite_s3_it',
+            disk:           's3',
+            driver:         'sqlite',
+        );
+
+        $backup = $this->runBackupSync($context);
+
+        self::assertSame(BackupStatus::Completed, $backup->status, (string) $backup->error_message);
+        self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/', (string) $backup->checksum);
+    }
+
+    /**
+     * A corrupted recorded checksum must be caught by full verification —
+     * re-running BackupVerifier against the same, untouched remote object
+     * with a deliberately wrong expected checksum proves the mismatch path
+     * actually compares against real remote content, not a mocked one.
+     */
+    public function test_full_checksum_verification_detects_a_checksum_mismatch_against_a_real_s3_compatible_service(): void
+    {
+        $this->app['config']->set('stream-backup.full_checksum_verification', true);
+
+        $context = new BackupContext(
+            tenantId:       null,
+            databaseName:   'sbr_s3_it_db',
+            connectionName: 'sqlite_s3_it',
+            disk:           's3',
+            driver:         'sqlite',
+        );
+
+        $backup = $this->runBackupSync($context);
+        self::assertSame(BackupStatus::Completed, $backup->status, (string) $backup->error_message);
+
+        $backup->forceFill(['checksum' => str_repeat('0', 64)])->save();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Backup checksum mismatch');
+
+        $this->app->make(BackupVerifier::class)->verify($backup);
     }
 
     public function test_encrypted_backup_round_trips_through_a_real_s3_compatible_service(): void
