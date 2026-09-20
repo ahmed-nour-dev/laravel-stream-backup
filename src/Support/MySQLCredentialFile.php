@@ -11,14 +11,19 @@ use Ahmednour\StreamBackup\DTOs\DatabaseCredentials;
  * passed to mysqldump via --defaults-extra-file instead of the command line
  * (which would leak them in `ps aux`).
  *
- * Cleanup is registered as a shutdown function: unlinking immediately after
- * proc_open() is racy on some kernels/filesystems because mysqldump may not
- * have opened the file yet, and immediate unlinking also leaves the file on
- * disk if the PHP process dies between proc_open and unlink.
+ * Deletion is explicit: callers must invoke delete() once the dump process
+ * that consumes the file has exited and its pipes/handle are closed (see
+ * AbstractProcessDumper::releaseResources() and ProcessBackupStream). A
+ * shutdown-function safety net is also registered in case the worker process
+ * dies before that explicit cleanup runs; it is a no-op once delete() has
+ * already removed the file, so long-lived queue workers never accumulate
+ * stale credential files across jobs.
  */
 final class MySQLCredentialFile
 {
     private ?string $path = null;
+
+    private bool $deleted = true;
 
     public function write(DatabaseCredentials $credentials): string
     {
@@ -39,12 +44,11 @@ final class MySQLCredentialFile
         file_put_contents($path, $contents);
         @chmod($path, 0600);
 
-        $this->path = $path;
+        $this->path    = $path;
+        $this->deleted = false;
 
-        register_shutdown_function(static function () use ($path): void {
-            if (is_file($path)) {
-                @unlink($path);
-            }
+        register_shutdown_function(function () use ($path): void {
+            $this->deleteIfExists($path);
         });
 
         return $path;
@@ -53,5 +57,30 @@ final class MySQLCredentialFile
     public function path(): ?string
     {
         return $this->path;
+    }
+
+    /**
+     * Remove the credential file. Safe to call multiple times (including
+     * from the shutdown-function safety net after an explicit call already
+     * removed it) and safe to call when write() was never called.
+     */
+    public function delete(): void
+    {
+        if ($this->path !== null) {
+            $this->deleteIfExists($this->path);
+        }
+    }
+
+    private function deleteIfExists(string $path): void
+    {
+        if ($this->deleted) {
+            return;
+        }
+
+        $this->deleted = true;
+
+        if (is_file($path)) {
+            @unlink($path);
+        }
     }
 }
