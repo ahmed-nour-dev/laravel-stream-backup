@@ -383,6 +383,7 @@ TableRestorer (runs inside a DB transaction)
 - **SIGTERM handling** with `pcntl_async_signals(true)` inside `RunBackupJob` — in-flight multipart uploads are aborted on graceful shutdown.
 - **Queue `$timeout = 0`** because backup runtime is determined by the DB, not by the worker.
 - **`TimeoutGuard`** enforces `timeouts.max_runtime` and `timeouts.idle_timeout` as safeguards that replace the disabled queue timeout — see [Timeouts](#timeouts) below.
+- **`DelimiterAwareStatementReader`** splits each table's SQL block on the active `DELIMITER` — not just a trailing `;` — so procedures, functions, triggers and events with internal semicolons restore as one statement instead of being chopped apart; it also tracks quoted strings/identifiers and comments so a delimiter occurrence inside either is ignored.
 
 ## Timeouts
 
@@ -447,6 +448,10 @@ Unit tests cover:
 The feature test `StreamPipelineSmokeTest` is auto-skipped unless a dump tool + compressor are on `PATH` and `STREAM_BACKUP_TEST_*` env vars are set.
 
 ## Changelog
+
+### v1.5.0
+- Restore statement splitting is now delimiter-aware (`DelimiterAwareStatementReader`): stored procedures, functions, triggers and events with internal semicolons — and their `DELIMITER $$ ... DELIMITER ;` wrapper — restore as single statements instead of being chopped on every line-ending `;`
+- Semicolons inside quoted strings/identifiers and comments no longer prematurely terminate a statement
 
 ### v1.4.0
 - Configurable `timeouts.max_runtime` and `timeouts.idle_timeout` safeguards, independent of Laravel's queue worker timeout — see [Timeouts](#timeouts)
