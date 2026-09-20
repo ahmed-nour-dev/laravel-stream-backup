@@ -60,10 +60,43 @@ use Illuminate\Support\Facades\Log;
  * it, but its FK is right there in the CREATE TABLE text. Dump order is
  * preserved for tables with no FK relationship in either source.
  *
- * Remaining caveat: a SELECTIVE restore of a table that is an FK parent of a
- * table NOT included in the restore still repoints the unrestored child's FK
- * to `_sbr_*`, which is dropped on success → orphaned FK metadata. Disable
- * `restore.atomic_restore` to opt out of shadow tables entirely.
+ * NAMED CONSTRAINT COLLISION (own shadow vs. own fresh table)
+ * -------------------------------------------------------------
+ * A RENAME TABLE does not rename the constraints defined ON the renamed
+ * table — a table's own named foreign keys keep their exact names once it
+ * becomes a `_sbr_*` shadow. mysqldump reproduces constraint names verbatim,
+ * so the dump's CREATE TABLE for that SAME table is about to declare a
+ * constraint with the identical name its own shadow still carries. MySQL
+ * enforces FK constraint name uniqueness per SCHEMA, not per table, so the
+ * CREATE fails with "Duplicate foreign key constraint name" (error 1826) —
+ * the shadow's own past self blocks its replacement. Before executing a
+ * table's dump block, `detachOutboundForeignKeys()` renames the shadow's own
+ * outbound FK constraints to collision-free temporary names (captured via
+ * information_schema, then DROP FOREIGN KEY + ADD CONSTRAINT); on rollback,
+ * `reattachOutboundForeignKeys()` restores the original names before the
+ * shadow is renamed back. A shadow that is instead dropped (clean success)
+ * simply takes its temp-named constraints with it — no restoration needed.
+ *
+ * SELECTIVE RESTORE FK-BOUNDARY GUARD
+ * ------------------------------------
+ * A selective restore of a table that is an FK parent of a table NOT
+ * included in the restore would repoint the unrestored child's FK to
+ * `_sbr_*`, which is dropped on success → permanently orphaned FK metadata.
+ * The same risk exists in reverse (a restored child whose FK references an
+ * unrestored parent) and for tables that mutually reference each other
+ * across the boundary. Rather than attempt to reason about which direction
+ * is actually safe under shadow-table replacement, `assertNoForeignKeyBoundaryViolations()`
+ * fails fast, before any destructive work, whenever a requested table has
+ * ANY foreign-key relationship — as parent or child — with a table outside
+ * the restore set. The dependency graph is read from both the live schema
+ * (information_schema.referential_constraints) and the dump's own declared
+ * FKs (SqlDumpParser::getForeignKeys(), which now covers every table in the
+ * dump, not only ones being restored, so a live child excluded from the
+ * restore is still visible even on a target where it doesn't exist yet).
+ * Disable `restore.atomic_restore` to opt out of shadow tables entirely — the
+ * boundary guard still applies, since a plain (non-shadow) selective restore
+ * is not immune to the underlying DROP+CREATE re-pointing children's FKs
+ * either.
  *
  * SKIP-ON-ERROR INTERACTION
  * -------------------------
@@ -106,6 +139,17 @@ final class TableRestorer
      */
     private array $shadows = [];
 
+    /**
+     * Map of real table name => the shadow's own outbound FK constraints
+     * (i.e. where the shadow is the FK CHILD) that were renamed to a
+     * collision-free temporary name by detachOutboundForeignKeys(), one
+     * entry per table whose shadow had at least one such constraint. See
+     * that method's docblock for why this is necessary.
+     *
+     * @var array<string, array<int, array{originalName: string, tempName: string, columns: string[], referencedTable: string, referencedColumns: string[], updateRule: string, deleteRule: string}>>
+     */
+    private array $detachedForeignKeys = [];
+
     public function __construct(Config $config)
     {
         $this->definerStripper = new DefinerStripper();
@@ -127,13 +171,22 @@ final class TableRestorer
      *                                              merged with the existing-schema graph so a table
      *                                              newly introduced by this restore still orders
      *                                              after a parent it references.
+     * @param bool                                  $selective   True when $tableBlocks represents a
+     *                                              caller-requested subset of tables rather than a
+     *                                              full restore. Only then is the FK restore-boundary
+     *                                              guard run — a full restore has no "outside the
+     *                                              set" tables to worry about by definition, and must
+     *                                              keep working unchanged.
      * @return RestoreResult
      *
-     * @throws RestoreFailedException If any SQL execution fails, or if stale
+     * @throws RestoreFailedException If any SQL execution fails, if stale
      *                                shadow tables from a previous crashed
-     *                                restore are detected.
+     *                                restore are detected, or if a selective
+     *                                restore's tables have a foreign-key
+     *                                relationship crossing the restore
+     *                                boundary.
      */
-    public function restore(array $tableBlocks, string $connection, float $startTime, array $dumpFkEdges = []): RestoreResult
+    public function restore(array $tableBlocks, string $connection, float $startTime, array $dumpFkEdges = [], bool $selective = false): RestoreResult
     {
         $db = DB::connection($connection);
         $totalRows      = 0;
@@ -141,6 +194,7 @@ final class TableRestorer
         $currentTable   = null;
         $this->skippedCount = 0;
         $this->shadows      = [];
+        $this->detachedForeignKeys = [];
 
         /** @var array<string, bool> $processed table => hadOriginalRenamedAside */
         $processed = [];
@@ -158,6 +212,10 @@ final class TableRestorer
             }
 
             $this->assertNoStaleShadows($db);
+
+            if ($selective) {
+                $this->assertNoForeignKeyBoundaryViolations($db, array_keys($tableBlocks), $dumpFkEdges);
+            }
 
             $this->execSql($db, 'SET FOREIGN_KEY_CHECKS = 0');
             Log::info('[Restore] Disabled foreign key checks.');
@@ -177,6 +235,16 @@ final class TableRestorer
                 if ($this->shadowTables && $this->tableExists($db, $tableName)) {
                     $this->renameAside($db, $tableName);
                     $hadOriginal = true;
+
+                    // Recorded before detachOutboundForeignKeys() runs so a
+                    // failure there still rolls back this table's rename
+                    // (see rollbackShadows()).
+                    $processed[$tableName] = $hadOriginal;
+
+                    $this->detachedForeignKeys[$tableName] = $this->detachOutboundForeignKeys(
+                        $db,
+                        $this->shadows[$tableName],
+                    );
                 }
                 $processed[$tableName] = $hadOriginal;
 
@@ -430,6 +498,180 @@ final class TableRestorer
     }
 
     /**
+     * Rename a shadow's own OUTBOUND foreign-key constraints (i.e. ones
+     * where the shadow is the FK CHILD) to collision-free temporary names.
+     *
+     * mysqldump reproduces a table's named constraints verbatim, so the
+     * dump's own CREATE TABLE for this same table is about to declare a
+     * constraint with the SAME name the shadow still carries (a RENAME
+     * TABLE does not rename the constraints defined on it). MySQL enforces
+     * foreign-key constraint name uniqueness per SCHEMA, not per table, so
+     * without this the CREATE fails with "Duplicate foreign key constraint
+     * name" (error 1826) — the shadow's own past self blocks its
+     * replacement. Returns the renamed definitions so
+     * reattachOutboundForeignKeys() can restore the original names if this
+     * table is later rolled back; a shadow that is instead dropped (clean
+     * success) simply takes its temp-named constraints with it.
+     *
+     * @return array<int, array{originalName: string, tempName: string, columns: string[], referencedTable: string, referencedColumns: string[], updateRule: string, deleteRule: string}>
+     */
+    private function detachOutboundForeignKeys(ConnectionInterface $db, string $shadowTable): array
+    {
+        $definitions = $this->fetchOutboundForeignKeyDefinitions($db, $shadowTable);
+
+        if ($definitions === []) {
+            return [];
+        }
+
+        $renamed = [];
+
+        foreach ($definitions as $originalName => $definition) {
+            $tempName = self::temporaryForeignKeyName($shadowTable, $originalName);
+
+            $this->execSql($db, "ALTER TABLE `{$shadowTable}` DROP FOREIGN KEY `{$originalName}`");
+            $this->execSql($db, "ALTER TABLE `{$shadowTable}` ADD CONSTRAINT `{$tempName}` "
+                . self::foreignKeyDefinitionSql($definition));
+
+            $renamed[] = array_merge($definition, [
+                'originalName' => $originalName,
+                'tempName'     => $tempName,
+            ]);
+        }
+
+        return $renamed;
+    }
+
+    /**
+     * Reverse of detachOutboundForeignKeys(): restore each temporarily
+     * renamed constraint to its original name. Called only while rolling a
+     * table back — right before the shadow (still under its shadow name at
+     * this point) is renamed back to the real table name.
+     *
+     * @param array<int, array{originalName: string, tempName: string, columns: string[], referencedTable: string, referencedColumns: string[], updateRule: string, deleteRule: string}> $renamedFks
+     */
+    private function reattachOutboundForeignKeys(ConnectionInterface $db, string $shadowTable, array $renamedFks): void
+    {
+        foreach ($renamedFks as $fk) {
+            $this->execSql($db, "ALTER TABLE `{$shadowTable}` DROP FOREIGN KEY `{$fk['tempName']}`");
+            $this->execSql($db, "ALTER TABLE `{$shadowTable}` ADD CONSTRAINT `{$fk['originalName']}` "
+                . self::foreignKeyDefinitionSql($fk));
+        }
+    }
+
+    /**
+     * The shadow's own outbound FK constraints (where it is the FK CHILD),
+     * grouped by constraint name so a composite (multi-column) FK is
+     * captured as one definition rather than one per column. Sourced from
+     * KEY_COLUMN_USAGE + REFERENTIAL_CONSTRAINTS — available on every MySQL
+     * version this package targets, unlike newer ALTER TABLE constraint-
+     * rename syntax.
+     *
+     * @return array<string, array{columns: string[], referencedTable: string, referencedColumns: string[], updateRule: string, deleteRule: string}>
+     */
+    private function fetchOutboundForeignKeyDefinitions(ConnectionInterface $db, string $table): array
+    {
+        $rows = $db->select(
+            'SELECT kcu.CONSTRAINT_NAME AS constraint_name, '
+            . 'kcu.COLUMN_NAME AS column_name, '
+            . 'kcu.REFERENCED_TABLE_NAME AS referenced_table, '
+            . 'kcu.REFERENCED_COLUMN_NAME AS referenced_column, '
+            . 'rc.UPDATE_RULE AS update_rule, '
+            . 'rc.DELETE_RULE AS delete_rule '
+            . 'FROM information_schema.KEY_COLUMN_USAGE kcu '
+            . 'JOIN information_schema.REFERENTIAL_CONSTRAINTS rc '
+            . '  ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA '
+            . '  AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME '
+            . '  AND rc.TABLE_NAME = kcu.TABLE_NAME '
+            . 'WHERE kcu.CONSTRAINT_SCHEMA = DATABASE() '
+            . '  AND kcu.TABLE_NAME = ? '
+            . '  AND kcu.REFERENCED_TABLE_NAME IS NOT NULL '
+            . 'ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION',
+            [$table],
+            false,
+        );
+
+        $definitions = [];
+
+        foreach ($rows as $row) {
+            $name       = self::rowString($row, 'constraint_name');
+            $column     = self::rowString($row, 'column_name');
+            $refTable   = self::rowString($row, 'referenced_table');
+            $refColumn  = self::rowString($row, 'referenced_column');
+            $updateRule = self::rowString($row, 'update_rule');
+            $deleteRule = self::rowString($row, 'delete_rule');
+
+            if ($name === '' || $column === '' || $refTable === '' || $refColumn === '') {
+                continue;
+            }
+
+            if (! isset($definitions[$name])) {
+                $definitions[$name] = [
+                    'columns'           => [],
+                    'referencedTable'   => $refTable,
+                    'referencedColumns' => [],
+                    'updateRule'        => $updateRule !== '' ? $updateRule : 'RESTRICT',
+                    'deleteRule'        => $deleteRule !== '' ? $deleteRule : 'RESTRICT',
+                ];
+            }
+
+            $definitions[$name]['columns'][]           = $column;
+            $definitions[$name]['referencedColumns'][] = $refColumn;
+        }
+
+        return $definitions;
+    }
+
+    /**
+     * Read a named column off an information_schema result row, tolerating
+     * both stdClass (PDO default fetch mode) and array rows.
+     */
+    private static function rowString(mixed $row, string $column): string
+    {
+        if (is_object($row) && isset($row->{$column})) {
+            return (string) $row->{$column};
+        }
+
+        if (is_array($row) && isset($row[$column])) {
+            return (string) $row[$column];
+        }
+
+        return '';
+    }
+
+    /**
+     * Render the "FOREIGN KEY (...) REFERENCES `t` (...) ON DELETE ... ON
+     * UPDATE ..." clause for a captured definition, for use in both
+     * detachOutboundForeignKeys() and reattachOutboundForeignKeys().
+     *
+     * @param array{columns: string[], referencedTable: string, referencedColumns: string[], updateRule: string, deleteRule: string} $definition
+     */
+    private static function foreignKeyDefinitionSql(array $definition): string
+    {
+        $columns    = implode(', ', array_map(static fn (string $c): string => "`{$c}`", $definition['columns']));
+        $refColumns = implode(', ', array_map(static fn (string $c): string => "`{$c}`", $definition['referencedColumns']));
+
+        return sprintf(
+            'FOREIGN KEY (%s) REFERENCES `%s` (%s) ON DELETE %s ON UPDATE %s',
+            $columns,
+            $definition['referencedTable'],
+            $refColumns,
+            $definition['deleteRule'],
+            $definition['updateRule'],
+        );
+    }
+
+    /**
+     * Deterministic, length-bounded temporary constraint name — same
+     * rationale as shadowName(): MySQL caps identifiers at 64 chars, and a
+     * stable hash keeps this collision-free across the tables in a single
+     * restore without needing to track allocated names.
+     */
+    private static function temporaryForeignKeyName(string $table, string $constraintName): string
+    {
+        return '_sbr_fk_' . substr(sha1($table . '::' . $constraintName), 0, 16);
+    }
+
+    /**
      * Drop the renamed-aside originals now that the fresh tables supersede
      * them. Best-effort per table: a failure leaves a shadow behind (the next
      * restore fail-fasts on it via assertNoStaleShadows) rather than aborting.
@@ -473,6 +715,11 @@ final class TableRestorer
 
                 if ($hadOriginal && isset($this->shadows[$table])) {
                     $shadow = $this->shadows[$table];
+
+                    if (! empty($this->detachedForeignKeys[$table])) {
+                        $this->reattachOutboundForeignKeys($db, $shadow, $this->detachedForeignKeys[$table]);
+                    }
+
                     $this->execSql($db, "RENAME TABLE `{$shadow}` TO `{$table}`");
                     Log::warning("[Restore] Rolled back table `{$table}` from shadow `{$shadow}`.");
                 } else {
@@ -613,6 +860,144 @@ final class TableRestorer
         }
 
         return $edges;
+    }
+
+    /**
+     * Fail fast, before any destructive work, if a selective restore's
+     * tables have a foreign-key relationship — as parent or child — with a
+     * table outside the requested restore set. See the class docblock's
+     * "SELECTIVE RESTORE FK-BOUNDARY GUARD" section for the rationale.
+     *
+     * @param string[]                                 $tables      The restore set (array_keys($tableBlocks)).
+     * @param array<int, array{0: string, 1: string}>  $dumpFkEdges FK edges parsed out of the dump (SqlDumpParser::getForeignKeys()).
+     *
+     * @throws RestoreFailedException If a cross-boundary relationship is found.
+     */
+    private function assertNoForeignKeyBoundaryViolations(ConnectionInterface $db, array $tables, array $dumpFkEdges): void
+    {
+        if ($tables === []) {
+            return;
+        }
+
+        $violations = self::findForeignKeyBoundaryViolations(
+            $tables,
+            $this->liveForeignKeyEdgesTouching($db, $tables),
+            $dumpFkEdges,
+        );
+
+        if ($violations === []) {
+            return;
+        }
+
+        throw new RestoreFailedException(self::formatForeignKeyBoundaryError($tables, $violations));
+    }
+
+    /**
+     * FK parent→child edges, as they exist in the target schema right now,
+     * where AT LEAST ONE endpoint is in $tables — i.e. every live FK that
+     * could possibly cross the restore boundary. Unlike fkEdges() (used for
+     * dependency ordering), this deliberately does NOT require both
+     * endpoints to be in $tables: an edge with exactly one endpoint inside
+     * the set is precisely the cross-boundary case the guard is looking for.
+     *
+     * @param string[] $tables
+     * @return array<int, array{0: string, 1: string}> list of [parent, child]
+     */
+    private function liveForeignKeyEdgesTouching(ConnectionInterface $db, array $tables): array
+    {
+        $placeholders = implode(',', array_fill(0, count($tables), '?'));
+
+        $rows = $db->select(
+            'SELECT referenced_table_name AS parent, table_name AS child '
+            . 'FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() '
+            . "AND (referenced_table_name IN ({$placeholders}) OR table_name IN ({$placeholders}))",
+            array_merge($tables, $tables),
+            false,
+        );
+
+        $edges = [];
+        foreach ($rows as $row) {
+            $parent = is_object($row) && isset($row->parent) ? (string) $row->parent : '';
+            $child  = is_object($row) && isset($row->child) ? (string) $row->child : '';
+
+            if ($parent !== '' && $child !== '') {
+                $edges[] = [$parent, $child];
+            }
+        }
+
+        return $edges;
+    }
+
+    /**
+     * Pure (no DB) core of the FK restore-boundary guard: merges live-schema
+     * edges with dump-declared edges and returns the deduplicated [parent,
+     * child] pairs that cross the restore boundary — i.e. exactly one
+     * endpoint is in $tables. An edge with both endpoints inside the set is
+     * dependency-closed (safe); an edge with both endpoints outside is
+     * irrelevant to this restore; a self-reference imposes no boundary.
+     * Directly unit-testable, same style as orderTables()/filterEdgesToTableSet().
+     *
+     * @param string[]                                 $tables
+     * @param array<int, array{0: string, 1: string}>  $liveEdges
+     * @param array<int, array{0: string, 1: string}>  $dumpFkEdges
+     * @return array<int, array{0: string, 1: string}> deduplicated [parent, child] violations
+     */
+    public static function findForeignKeyBoundaryViolations(array $tables, array $liveEdges, array $dumpFkEdges): array
+    {
+        if ($tables === []) {
+            return [];
+        }
+
+        $set = array_flip($tables);
+        $violations = [];
+
+        foreach (array_merge($liveEdges, $dumpFkEdges) as [$parent, $child]) {
+            if ($parent === $child) {
+                continue;
+            }
+
+            $parentIn = isset($set[$parent]);
+            $childIn  = isset($set[$child]);
+
+            if ($parentIn === $childIn) {
+                // Both inside (dependency-closed) or both outside (irrelevant).
+                continue;
+            }
+
+            $violations["{$parent}\0{$child}"] = [$parent, $child];
+        }
+
+        return array_values($violations);
+    }
+
+    /**
+     * Render a clear, actionable error naming every table involved in a
+     * cross-boundary FK relationship and which side of it falls outside the
+     * requested restore set.
+     *
+     * @param string[]                                 $tables     The requested restore set.
+     * @param array<int, array{0: string, 1: string}>  $violations As returned by findForeignKeyBoundaryViolations().
+     */
+    private static function formatForeignKeyBoundaryError(array $tables, array $violations): string
+    {
+        $set = array_flip($tables);
+        $lines = [];
+
+        foreach ($violations as [$parent, $child]) {
+            $lines[] = isset($set[$parent])
+                ? "`{$parent}` (requested) is referenced by a foreign key on `{$child}` (not requested)"
+                : "`{$child}` (requested) has a foreign key referencing `{$parent}` (not requested)";
+        }
+
+        return sprintf(
+            'Selective restore aborted: the requested tables (%s) have a foreign-key '
+            . 'relationship crossing the restore boundary: %s. Include the related '
+            . 'table(s) in the restore, or remove the foreign key, before retrying. '
+            . '(A future version may support automatic dependency closure.)',
+            implode(', ', array_map(static fn (string $t): string => "`{$t}`", $tables)),
+            implode('; ', $lines),
+        );
     }
 
     /**

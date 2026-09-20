@@ -131,7 +131,13 @@ final class RestorePipeline
                 $onProgress(RestoreStatus::Importing);
             }
             Log::debug("[RestorePipeline] Handing over to TableRestorer...");
-            $result = $this->restorer->restore($tableBlocks, $context->connectionName, $startTime, $dumpFkEdges);
+            $result = $this->restorer->restore(
+                $tableBlocks,
+                $context->connectionName,
+                $startTime,
+                $dumpFkEdges,
+                $context->tables !== [],
+            );
             Log::debug("[RestorePipeline] TableRestorer completed.");
             return $result;
         } catch (\Throwable $e) {

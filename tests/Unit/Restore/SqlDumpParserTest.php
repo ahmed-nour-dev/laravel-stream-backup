@@ -201,6 +201,35 @@ SQL;
         self::assertSame([], $withoutFk->getForeignKeys());
     }
 
+    public function test_fk_edges_are_captured_even_for_a_table_excluded_from_a_selective_restore(): void
+    {
+        // Selective restore requesting ONLY `customers`; `orders` (which
+        // declares the FK) is skipped entirely — never buffered. The edge
+        // must still surface: TableRestorer's cross-boundary safety guard
+        // (Ahmednour/laravel-stream-backup#19) needs it to detect that the
+        // requested `customers` table is an FK parent of an unrequested live
+        // table, purely from the dump text, with no information_schema row
+        // required.
+        $parser = new SqlDumpParser(['customers']);
+        $parser->feed($this->dump([
+            'customers' => "CREATE TABLE `customers` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  PRIMARY KEY (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+            'orders' => "CREATE TABLE `orders` (\n"
+                . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+                . "  `customer_id` INT UNSIGNED NOT NULL,\n"
+                . "  PRIMARY KEY (`id`),\n"
+                . "  CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)\n"
+                . ") ENGINE=InnoDB;\n",
+        ]));
+
+        $blocks = $parser->finish();
+
+        self::assertSame(['customers'], array_keys($blocks), 'orders must not be buffered — it was not requested.');
+        self::assertSame([['customers', 'orders']], $parser->getForeignKeys());
+    }
+
     /**
      * Builds a minimal mysqldump-shaped string: a "Table structure" marker
      * followed by the given CREATE TABLE body, for each table.

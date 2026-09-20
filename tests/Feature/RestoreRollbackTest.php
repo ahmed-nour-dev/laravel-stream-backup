@@ -183,6 +183,18 @@ final class RestoreRollbackTest extends TestCase
         self::assertNotNull($fk);
         self::assertSame(1, (int) $fk->n, 'FK on orders must still reference customers after rollback.');
 
+        // The rollback must restore the constraint under its ORIGINAL name
+        // (reattachOutboundForeignKeys()), not leave it renamed to the
+        // collision-free temporary name detachOutboundForeignKeys() used
+        // while `orders` was being recreated.
+        $fkName = $db->selectOne(
+            'SELECT constraint_name AS name FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() AND table_name = ? AND referenced_table_name = ?',
+            ['orders', 'customers']
+        );
+        self::assertNotNull($fkName);
+        self::assertSame('fk_orders_customer', $fkName->name, 'Rollback must restore the FK under its original name, not a temp _sbr_fk_* name.');
+
         // --- Index integrity survived the rename round-trip ----------------
         $idx = $db->selectOne(
             'SELECT COUNT(*) AS n FROM information_schema.statistics '
@@ -442,6 +454,21 @@ final class RestoreRollbackTest extends TestCase
         self::assertNotNull($fk);
         self::assertSame(1, (int) $fk->n, 'FK on accessories must resolve to widgets (not a dropped _sbr_* shadow) after a clean restore.');
 
+        // Regression for the "own shadow blocks own replacement" bug: the
+        // fresh accessories table's constraint (declared verbatim by the
+        // dump) must retain its real name, proving detachOutboundForeignKeys()
+        // successfully freed that name from `_sbr_accessories` before this
+        // CREATE TABLE ran — otherwise the restore above would have failed
+        // with MySQL error 1826 (Duplicate foreign key constraint name)
+        // rather than reaching this assertion at all.
+        $fkName = $db->selectOne(
+            'SELECT constraint_name AS name FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() AND table_name = ? AND referenced_table_name = ?',
+            ['accessories', 'widgets']
+        );
+        self::assertNotNull($fkName);
+        self::assertSame('fk_accessories_widget', $fkName->name);
+
         // And no FK may reference a leftover _sbr_* shadow name.
         $dangling = $db->selectOne(
             'SELECT COUNT(*) AS n FROM information_schema.referential_constraints '
@@ -564,6 +591,262 @@ final class RestoreRollbackTest extends TestCase
             $enforced = true;
         }
         self::assertTrue($enforced, 'FK on orders must be enforced (reject a dangling customer_id) after restore.');
+    }
+
+    // -- Selective-restore FK-boundary guard ---------------------------------
+    // Ahmednour/laravel-stream-backup#19: restoring a table that has a live
+    // foreign-key relationship with a table OUTSIDE the requested set must
+    // fail fast, before any shadow table is created or any statement runs —
+    // in either direction (parent-only or child-only), and regardless of
+    // shadow tables being the mechanism that would otherwise orphan the FK.
+
+    public function test_selective_restore_rejects_parent_only_selection_referenced_by_an_unrequested_live_child(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        $db->unprepared('CREATE TABLE `customers` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->unprepared('CREATE TABLE `orders` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `customer_id` INT UNSIGNED NOT NULL,
+            PRIMARY KEY (`id`),
+            CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->insert('INSERT INTO `customers` (`id`, `name`) VALUES (?, ?)', [1, 'original-customer']);
+        $db->insert('INSERT INTO `orders` (`id`, `customer_id`) VALUES (?, ?)', [1, 1]);
+
+        // Only `customers` (the FK PARENT) is requested; `orders` (the live
+        // child) is not part of this restore at all.
+        $customersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `customers`;\n"
+            . "CREATE TABLE `customers` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `name` VARCHAR(100) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `customers` (`id`, `name`) VALUES (1, 'restored-customer');\n"
+        );
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        try {
+            $restorer->restore(
+                ['customers' => $customersBlock],
+                'mysql_test',
+                microtime(true),
+                [],
+                true,
+            );
+            self::fail('Expected RestoreFailedException: customers is an FK parent of the unrequested orders table.');
+        } catch (RestoreFailedException $e) {
+            self::assertStringContainsString('customers', $e->getMessage());
+            self::assertStringContainsString('orders', $e->getMessage());
+        }
+
+        // The guard must fire BEFORE any destructive work: original data
+        // intact, no shadow table ever created.
+        $customer = $db->selectOne('SELECT `name` FROM `customers` WHERE `id` = 1');
+        self::assertNotNull($customer);
+        self::assertSame('original-customer', $customer->name);
+
+        $shadows = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.tables '
+            . 'WHERE table_schema = DATABASE() AND table_name LIKE CONCAT(?, ?, ?)',
+            ['_', 'sbr_', '%']
+        );
+        self::assertNotNull($shadows);
+        self::assertSame(0, (int) $shadows->n, 'The guard must fire before any shadow table is created.');
+    }
+
+    public function test_selective_restore_rejects_child_only_selection_referencing_an_unrequested_live_parent(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        $db->unprepared('CREATE TABLE `customers` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->unprepared('CREATE TABLE `orders` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `customer_id` INT UNSIGNED NOT NULL,
+            PRIMARY KEY (`id`),
+            CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->insert('INSERT INTO `customers` (`id`, `name`) VALUES (?, ?)', [1, 'original-customer']);
+        $db->insert('INSERT INTO `orders` (`id`, `customer_id`) VALUES (?, ?)', [1, 1]);
+
+        // Only `orders` (the FK CHILD) is requested; `customers` (its live
+        // parent) is not part of this restore.
+        $ordersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `orders`;\n"
+            . "CREATE TABLE `orders` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `customer_id` INT UNSIGNED NOT NULL,\n"
+            . "  PRIMARY KEY (`id`),\n"
+            . "  CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `orders` (`id`, `customer_id`) VALUES (1, 1);\n"
+        );
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        try {
+            $restorer->restore(
+                ['orders' => $ordersBlock],
+                'mysql_test',
+                microtime(true),
+                [],
+                true,
+            );
+            self::fail('Expected RestoreFailedException: orders references the unrequested customers table.');
+        } catch (RestoreFailedException $e) {
+            self::assertStringContainsString('customers', $e->getMessage());
+            self::assertStringContainsString('orders', $e->getMessage());
+        }
+
+        $order = $db->selectOne('SELECT `customer_id` FROM `orders` WHERE `id` = 1');
+        self::assertNotNull($order);
+        self::assertSame(1, (int) $order->customer_id);
+
+        $shadows = $db->selectOne(
+            'SELECT COUNT(*) AS n FROM information_schema.tables '
+            . 'WHERE table_schema = DATABASE() AND table_name LIKE CONCAT(?, ?, ?)',
+            ['_', 'sbr_', '%']
+        );
+        self::assertNotNull($shadows);
+        self::assertSame(0, (int) $shadows->n, 'The guard must fire before any shadow table is created.');
+    }
+
+    public function test_selective_restore_allows_a_dependency_closed_selection_of_parent_and_child(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        $db->unprepared('CREATE TABLE `customers` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->unprepared('CREATE TABLE `orders` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `customer_id` INT UNSIGNED NOT NULL,
+            PRIMARY KEY (`id`),
+            CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->insert('INSERT INTO `customers` (`id`, `name`) VALUES (?, ?)', [1, 'original-customer']);
+        $db->insert('INSERT INTO `orders` (`id`, `customer_id`) VALUES (?, ?)', [1, 1]);
+
+        // Both sides of the FK are requested — dependency-closed, so the
+        // guard must NOT block this even though it's a selective restore.
+        $customersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `customers`;\n"
+            . "CREATE TABLE `customers` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `name` VARCHAR(100) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `customers` (`id`, `name`) VALUES (1, 'restored-customer');\n"
+        );
+
+        $ordersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `orders`;\n"
+            . "CREATE TABLE `orders` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `customer_id` INT UNSIGNED NOT NULL,\n"
+            . "  PRIMARY KEY (`id`),\n"
+            . "  CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `orders` (`id`, `customer_id`) VALUES (1, 1);\n"
+        );
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        $result = $restorer->restore(
+            ['orders' => $ordersBlock, 'customers' => $customersBlock],
+            'mysql_test',
+            microtime(true),
+            [],
+            true,
+        );
+
+        self::assertSame(['customers', 'orders'], $result->tablesRestored);
+
+        $customer = $db->selectOne('SELECT `name` FROM `customers` WHERE `id` = 1');
+        self::assertNotNull($customer);
+        self::assertSame('restored-customer', $customer->name);
+
+        $order = $db->selectOne('SELECT `customer_id` FROM `orders` WHERE `id` = 1');
+        self::assertNotNull($order);
+        self::assertSame(1, (int) $order->customer_id);
+    }
+
+    public function test_non_selective_restore_skips_the_boundary_guard_even_with_a_cross_boundary_relationship(): void
+    {
+        $this->skipUnlessMysqlAvailable();
+        $this->cleanSchema();
+
+        $db = $this->db();
+
+        $db->unprepared('CREATE TABLE `customers` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->unprepared('CREATE TABLE `orders` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `customer_id` INT UNSIGNED NOT NULL,
+            PRIMARY KEY (`id`),
+            CONSTRAINT `fk_orders_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+        ) ENGINE=InnoDB');
+
+        $db->insert('INSERT INTO `customers` (`id`, `name`) VALUES (?, ?)', [1, 'original-customer']);
+        $db->insert('INSERT INTO `orders` (`id`, `customer_id`) VALUES (?, ?)', [1, 1]);
+
+        $customersBlock = $this->buffer(
+            "DROP TABLE IF EXISTS `customers`;\n"
+            . "CREATE TABLE `customers` (\n"
+            . "  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,\n"
+            . "  `name` VARCHAR(100) NOT NULL,\n"
+            . "  PRIMARY KEY (`id`)\n"
+            . ") ENGINE=InnoDB;\n"
+            . "INSERT INTO `customers` (`id`, `name`) VALUES (1, 'restored-customer');\n"
+        );
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+
+        // $selective defaults to false: acceptance criterion "Full restores
+        // continue to work unchanged" — the guard must not run at all, even
+        // though `orders` (live, untouched) has an FK on `customers`.
+        $result = $restorer->restore(
+            ['customers' => $customersBlock],
+            'mysql_test',
+            microtime(true),
+        );
+
+        self::assertSame(['customers'], $result->tablesRestored);
+
+        $customer = $db->selectOne('SELECT `name` FROM `customers` WHERE `id` = 1');
+        self::assertNotNull($customer);
+        self::assertSame('restored-customer', $customer->name);
     }
 
     // ------------------------------------------------------------------

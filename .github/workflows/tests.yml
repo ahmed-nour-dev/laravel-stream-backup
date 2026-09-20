@@ -37,6 +37,32 @@ jobs:
 
     name: PHP ${{ matrix.php }} - Laravel ${{ matrix.laravel }} - ${{ matrix.stability }}
 
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: stream_backup_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # Consumed by the MySQL-gated feature tests (RestoreRollbackTest,
+      # RestoreLargeScaleIntegrationTest, StreamPipelineSmokeTest,
+      # RestorePipelineFailureModesTest) to exercise the shadow-table
+      # rollback, FK dependency ordering, and the selective-restore
+      # FK-boundary guard against a real MySQL server instead of skipping.
+      STREAM_BACKUP_TEST_HOST: 127.0.0.1
+      STREAM_BACKUP_TEST_PORT: 3306
+      STREAM_BACKUP_TEST_USER: root
+      STREAM_BACKUP_TEST_PASSWORD: root
+      STREAM_BACKUP_TEST_DATABASE: stream_backup_test
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,9 +76,17 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: pcntl, hash, mbstring, pdo, pdo_sqlite, sqlite3, intl, bcmath
+          extensions: pcntl, hash, mbstring, pdo, pdo_sqlite, sqlite3, pdo_mysql, mysqli, intl, bcmath
           coverage: none
           tools: composer:v2
+
+      - name: Wait for MySQL to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            mysqladmin ping -h 127.0.0.1 -P 3306 -u root -proot --silent && break
+            sleep 2
+          done
+          mysqladmin ping -h 127.0.0.1 -P 3306 -u root -proot --silent
 
       - name: Get composer cache directory
         id: composer-cache
