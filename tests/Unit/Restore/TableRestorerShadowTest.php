@@ -61,6 +61,78 @@ final class TableRestorerShadowTest extends TestCase
         );
     }
 
+    // -- Named-constraint collision avoidance (detachOutboundForeignKeys) ----
+    // Pure (no DB) coverage of the two private static helpers that back the
+    // fix for MySQL error 1826 "Duplicate foreign key constraint name": a
+    // shadow retains its own outbound FK constraint's exact name across the
+    // RENAME, and the dump's CREATE TABLE for that same table redeclares the
+    // identical name, so it must be freed on the shadow first. The
+    // MySQL-gated RestoreRollbackTest exercises the full round-trip
+    // (including the real 1826 collision without the fix) against a server.
+
+    public function test_temporary_foreign_key_name_is_deterministic_and_bounded(): void
+    {
+        $ref = new \ReflectionMethod(TableRestorer::class, 'temporaryForeignKeyName');
+        $ref->setAccessible(true);
+
+        $name = $ref->invoke(null, '_sbr_orders', 'fk_orders_customer');
+
+        self::assertSame($name, $ref->invoke(null, '_sbr_orders', 'fk_orders_customer'));
+        self::assertLessThanOrEqual(64, strlen($name));
+        self::assertStringStartsWith('_sbr_fk_', $name);
+    }
+
+    public function test_temporary_foreign_key_name_differs_for_different_tables_or_constraints(): void
+    {
+        $ref = new \ReflectionMethod(TableRestorer::class, 'temporaryForeignKeyName');
+        $ref->setAccessible(true);
+
+        $a = $ref->invoke(null, '_sbr_orders', 'fk_orders_customer');
+        $b = $ref->invoke(null, '_sbr_invoices', 'fk_orders_customer');
+        $c = $ref->invoke(null, '_sbr_orders', 'fk_orders_warehouse');
+
+        self::assertNotSame($a, $b);
+        self::assertNotSame($a, $c);
+    }
+
+    public function test_foreign_key_definition_sql_renders_a_single_column_fk(): void
+    {
+        $ref = new \ReflectionMethod(TableRestorer::class, 'foreignKeyDefinitionSql');
+        $ref->setAccessible(true);
+
+        $sql = $ref->invoke(null, [
+            'columns'           => ['customer_id'],
+            'referencedTable'   => 'customers',
+            'referencedColumns' => ['id'],
+            'updateRule'        => 'CASCADE',
+            'deleteRule'        => 'RESTRICT',
+        ]);
+
+        self::assertSame(
+            'FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE',
+            $sql,
+        );
+    }
+
+    public function test_foreign_key_definition_sql_renders_a_composite_fk(): void
+    {
+        $ref = new \ReflectionMethod(TableRestorer::class, 'foreignKeyDefinitionSql');
+        $ref->setAccessible(true);
+
+        $sql = $ref->invoke(null, [
+            'columns'           => ['tenant_id', 'customer_id'],
+            'referencedTable'   => 'customers',
+            'referencedColumns' => ['tenant_id', 'id'],
+            'updateRule'        => 'RESTRICT',
+            'deleteRule'        => 'CASCADE',
+        ]);
+
+        self::assertSame(
+            'FOREIGN KEY (`tenant_id`, `customer_id`) REFERENCES `customers` (`tenant_id`, `id`) ON DELETE CASCADE ON UPDATE RESTRICT',
+            $sql,
+        );
+    }
+
     public function test_restore_rejects_non_mysql_driver_with_a_clear_error(): void
     {
         // The default Testbench connection is SQLite (:memory:). Shadow-table

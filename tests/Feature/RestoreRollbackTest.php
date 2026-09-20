@@ -183,6 +183,18 @@ final class RestoreRollbackTest extends TestCase
         self::assertNotNull($fk);
         self::assertSame(1, (int) $fk->n, 'FK on orders must still reference customers after rollback.');
 
+        // The rollback must restore the constraint under its ORIGINAL name
+        // (reattachOutboundForeignKeys()), not leave it renamed to the
+        // collision-free temporary name detachOutboundForeignKeys() used
+        // while `orders` was being recreated.
+        $fkName = $db->selectOne(
+            'SELECT constraint_name AS name FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() AND table_name = ? AND referenced_table_name = ?',
+            ['orders', 'customers']
+        );
+        self::assertNotNull($fkName);
+        self::assertSame('fk_orders_customer', $fkName->name, 'Rollback must restore the FK under its original name, not a temp _sbr_fk_* name.');
+
         // --- Index integrity survived the rename round-trip ----------------
         $idx = $db->selectOne(
             'SELECT COUNT(*) AS n FROM information_schema.statistics '
@@ -441,6 +453,21 @@ final class RestoreRollbackTest extends TestCase
         );
         self::assertNotNull($fk);
         self::assertSame(1, (int) $fk->n, 'FK on accessories must resolve to widgets (not a dropped _sbr_* shadow) after a clean restore.');
+
+        // Regression for the "own shadow blocks own replacement" bug: the
+        // fresh accessories table's constraint (declared verbatim by the
+        // dump) must retain its real name, proving detachOutboundForeignKeys()
+        // successfully freed that name from `_sbr_accessories` before this
+        // CREATE TABLE ran — otherwise the restore above would have failed
+        // with MySQL error 1826 (Duplicate foreign key constraint name)
+        // rather than reaching this assertion at all.
+        $fkName = $db->selectOne(
+            'SELECT constraint_name AS name FROM information_schema.referential_constraints '
+            . 'WHERE constraint_schema = DATABASE() AND table_name = ? AND referenced_table_name = ?',
+            ['accessories', 'widgets']
+        );
+        self::assertNotNull($fkName);
+        self::assertSame('fk_accessories_widget', $fkName->name);
 
         // And no FK may reference a leftover _sbr_* shadow name.
         $dangling = $db->selectOne(
