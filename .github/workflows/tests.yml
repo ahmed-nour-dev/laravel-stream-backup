@@ -110,4 +110,4 @@ jobs:
           find src -name "*.php" -print0 | xargs -0 -n1 -P4 php -l > /dev/null
 
       - name: Execute PHPUnit tests
-        run: vendor/bin/phpunit --colors=always
+        run: vendor/bin/phpunit --testsuite Unit,Feature --colors=always
