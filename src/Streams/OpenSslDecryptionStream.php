@@ -163,6 +163,14 @@ final class OpenSslDecryptionStream implements BackupStream
      * Read exactly $needed bytes from the inner stream, buffering partial reads.
      *
      * Returns null if not enough data is available yet (non-blocking).
+     *
+     * A well-formed encrypted backup always terminates with the explicit
+     * 4-byte EOF marker, which is consumed directly by read() and never
+     * reaches this method. So if the inner stream ends before $needed bytes
+     * are available — whether that's before the header, mid-frame, or right
+     * after the last data frame with the EOF marker missing — the stream is
+     * truncated or malformed, and we must fail loudly rather than silently
+     * treating a short read as a legitimately finished restore.
      */
     private function readExactly(int $needed): ?string
     {
@@ -170,14 +178,11 @@ final class OpenSslDecryptionStream implements BackupStream
             $chunk = $this->inner->read($needed - strlen($this->readBuffer));
 
             if ($chunk === null) {
-                // Inner stream ended before we got enough bytes.
-                if ($this->readBuffer !== '') {
-                    throw new InvalidBackupException(
-                        'Encrypted backup stream ended unexpectedly mid-frame.'
-                    );
-                }
-                $this->eof = true;
-                return null;
+                throw new InvalidBackupException(
+                    $this->readBuffer === ''
+                        ? 'Encrypted backup stream ended unexpectedly: missing header or EOF marker.'
+                        : 'Encrypted backup stream ended unexpectedly mid-frame.'
+                );
             }
 
             if ($chunk === '') {
