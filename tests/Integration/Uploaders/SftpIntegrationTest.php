@@ -49,6 +49,7 @@ final class SftpIntegrationTest extends TestCase
         $this->runPackageMigrations();
 
         $this->dbPath = sys_get_temp_dir() . '/sbr_sftp_it_' . bin2hex(random_bytes(6)) . '.sqlite';
+        touch($this->dbPath); // Laravel's SQLiteConnector requires the file to pre-exist — it never creates it.
 
         $this->app['config']->set('database.connections.sqlite_sftp_it', [
             'driver'   => 'sqlite',
