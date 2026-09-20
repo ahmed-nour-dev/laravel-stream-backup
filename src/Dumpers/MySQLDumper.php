@@ -16,7 +16,9 @@ use Illuminate\Contracts\Config\Repository as Config;
  *
  * Credentials are written to a temporary file passed via
  * --defaults-extra-file so the password never appears on the
- * command line (which would leak via `ps aux`).
+ * command line (which would leak via `ps aux`). The file is deleted via
+ * releaseResources() as soon as the mysqldump process it was written for
+ * has ended — see AbstractProcessDumper::dump() and MySQLCredentialFile.
  *
  * Extends AbstractProcessDumper via the Template Method pattern —
  * all proc_open boilerplate lives in the base class.
@@ -61,6 +63,11 @@ final class MySQLDumper extends AbstractProcessDumper
     public function name(): string
     {
         return 'mysqldump';
+    }
+
+    protected function releaseResources(): void
+    {
+        $this->credentialFile->delete();
     }
 
     private function resolveCredentials(BackupContext $context): DatabaseCredentials

@@ -34,20 +34,34 @@ final class ProcessBackupStream implements BackupStream
 
     private bool $closed = false;
 
+    private ?\Closure $onProcessEnded;
+
     /**
-     * @param resource      $process proc_open handle
-     * @param resource      $stdout  pipe 1 (already set non-blocking)
-     * @param resource|null $stderr  pipe 2 (already set non-blocking), may be null if not captured
+     * @param resource      $process        proc_open handle
+     * @param resource      $stdout         pipe 1 (already set non-blocking)
+     * @param resource|null $stderr         pipe 2 (already set non-blocking), may be null if not captured
+     * @param \Closure|null $onProcessEnded invoked exactly once, once the process has exited and its
+     *                                      pipes/handle are closed — whether via close() or, when a
+     *                                      caller kills the process resource directly without calling
+     *                                      close(), via __destruct() as a safety net. Used by dumpers to
+     *                                      release resources tied to the process (e.g. a credential file).
      */
     public function __construct(
         $process,
         $stdout,
         $stderr,
         private readonly string $label = 'process',
+        ?\Closure $onProcessEnded = null,
     ) {
-        $this->process = $process;
-        $this->stdout  = $stdout;
-        $this->stderr  = $stderr;
+        $this->process        = $process;
+        $this->stdout         = $stdout;
+        $this->stderr         = $stderr;
+        $this->onProcessEnded = $onProcessEnded;
+    }
+
+    public function __destruct()
+    {
+        $this->runOnProcessEnded();
     }
 
     public function read(int $length = 65536): ?string
@@ -93,7 +107,14 @@ final class ProcessBackupStream implements BackupStream
             @fclose($this->stderr);
         }
 
-        $exitCode = $this->waitForExit();
+        try {
+            $exitCode = $this->waitForExit();
+        } finally {
+            // The process has exited (or been terminated) and proc_close()
+            // has run by this point — safe to release tied resources
+            // regardless of whether the exit code check below throws.
+            $this->runOnProcessEnded();
+        }
 
         if ($exitCode !== 0) {
             throw new DumpFailedException(sprintf(
@@ -140,6 +161,17 @@ final class ProcessBackupStream implements BackupStream
         while (($chunk = @fread($this->stderr, 8192)) !== false && $chunk !== '') {
             $this->stderrBuffer .= $chunk;
         }
+    }
+
+    private function runOnProcessEnded(): void
+    {
+        if ($this->onProcessEnded === null) {
+            return;
+        }
+
+        $callback             = $this->onProcessEnded;
+        $this->onProcessEnded = null;
+        $callback();
     }
 
     private function waitForExit(): int
