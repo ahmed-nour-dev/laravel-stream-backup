@@ -255,8 +255,11 @@ final class TableRestorer
     /**
      * Execute SQL statements from a php://temp buffer against the connection.
      *
-     * Reads the buffer line-by-line, accumulating multi-line statements
-     * (delimited by `;`), and executes each complete statement.
+     * Reads the buffer line-by-line through a {@see DelimiterAwareStatementReader},
+     * which tracks the active `DELIMITER`, quoted strings/identifiers, and
+     * comments — so stored procedures/functions/triggers/events containing
+     * internal semicolons (and their `DELIMITER $$ ... DELIMITER ;` wrapper)
+     * restore correctly instead of being chopped at every line-ending `;`.
      *
      * @param ConnectionInterface $db
      * @param resource           $buffer
@@ -266,34 +269,16 @@ final class TableRestorer
     private function executeBuffer(ConnectionInterface $db, $buffer, string $tableName): int
     {
         $totalRows = 0;
-        $statement = '';
+        $reader = new DelimiterAwareStatementReader();
 
         while (($line = fgets($buffer)) !== false) {
-            $trimmed = trim($line);
-
-            // Skip empty lines and SQL comments (-- and /* ... */).
-            if ($trimmed === '' || str_starts_with($trimmed, '--')) {
-                continue;
-            }
-
-            $statement .= $line;
-
-            // Execute when we reach a semicolon at the end of a line.
-            // mysqldump always terminates statements with ";\n".
-            if (str_ends_with($trimmed, ';')) {
-                $cleanStatement = trim($statement);
-
-                if ($cleanStatement !== '' && $cleanStatement !== ';') {
-                    $totalRows += $this->executeStatement($db, $cleanStatement, $tableName);
-                }
-
-                $statement = '';
+            foreach ($reader->feedLine($line) as $statement) {
+                $totalRows += $this->executeStatement($db, $statement, $tableName);
             }
         }
 
-        // Execute any remaining partial statement.
-        $remaining = trim($statement);
-        if ($remaining !== '' && $remaining !== ';') {
+        $remaining = $reader->flush();
+        if ($remaining !== null) {
             $totalRows += $this->executeStatement($db, $remaining, $tableName);
         }
 

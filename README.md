@@ -429,6 +429,7 @@ In short: backup-time disk usage is capped at roughly `multipart.part_size` no m
 - **SIGTERM handling** with `pcntl_async_signals(true)` inside `RunBackupJob` — in-flight multipart uploads are aborted on graceful shutdown.
 - **Queue `$timeout = 0`** because backup runtime is determined by the DB, not by the worker.
 - **`TimeoutGuard`** enforces `timeouts.max_runtime` and `timeouts.idle_timeout` as safeguards that replace the disabled queue timeout — see [Timeouts](#timeouts) below.
+- **`DelimiterAwareStatementReader`** splits each table's SQL block on the active `DELIMITER` — not just a trailing `;` — so procedures, functions, triggers and events with internal semicolons restore as one statement instead of being chopped apart; it also tracks quoted strings/identifiers and comments so a delimiter occurrence inside either is ignored.
 
 ## Timeouts
 
@@ -495,6 +496,10 @@ The feature test `StreamPipelineSmokeTest` is auto-skipped unless a dump tool + 
 Feature tests also cover `RunBackupJob` retry behavior: a failed attempt followed by a successful retry must share one `backups` row and produce two `backup_attempts` rows (`RunBackupJobAttemptTrackingTest`).
 
 ## Changelog
+
+### v1.5.0
+- Restore statement splitting is now delimiter-aware (`DelimiterAwareStatementReader`): stored procedures, functions, triggers and events with internal semicolons — and their `DELIMITER $$ ... DELIMITER ;` wrapper — restore as single statements instead of being chopped on every line-ending `;`
+- Semicolons inside quoted strings/identifiers and comments no longer prematurely terminate a statement
 
 ### v1.4.0
 - Track backup attempts separately from the logical backup: `RunBackupJob` retries now share one `backups` row (matched via `attempt_group_id`) instead of creating an independent row per attempt
