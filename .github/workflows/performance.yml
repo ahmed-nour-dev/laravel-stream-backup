@@ -1,0 +1,52 @@
+name: performance
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  performance:
+    runs-on: ubuntu-latest
+    name: Large-stream memory & throughput regression
+
+    # Single PHP/Laravel pairing, no database or object-storage services —
+    # this suite drives StreamPipeline against a synthetic, on-the-fly
+    # generated dump and a local-disk uploader, so its cost is dominated by
+    # PHP/subprocess startup rather than anything worth matrixing (that's
+    # what tests.yml's PHP/Laravel matrix is for).
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pigz gzip
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pcntl, hash, mbstring, pdo, pdo_sqlite, sqlite3, intl, bcmath, openssl, sodium
+          coverage: none
+          tools: composer:v2
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-performance-php-8.3-${{ hashFiles('**/composer.json') }}
+          restore-keys: |
+            ${{ runner.os }}-performance-php-8.3-
+
+      - name: Install dependencies
+        run: composer update --prefer-stable --prefer-dist --no-interaction --no-progress
+
+      - name: Execute performance tests
+        run: vendor/bin/phpunit --testsuite Performance --colors=always
