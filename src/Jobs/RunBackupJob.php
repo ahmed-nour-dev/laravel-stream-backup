@@ -125,6 +125,21 @@ class RunBackupJob implements ShouldQueue
                 ],
             );
 
+            if ($backup->status === BackupStatus::Completed) {
+                // A late/duplicate delivery of an already-succeeded logical
+                // backup (e.g. a retry queued before the success was acked,
+                // or an operator re-dispatch). Re-running the whole pipeline
+                // here would overwrite a valid completed remote object with
+                // a redundant re-upload — see BackupReconciler's docblock
+                // for why that guarantee matters. Finalization for the same
+                // logical backup must be idempotent, so this is a no-op.
+                Log::info('stream-backup: skipping RunBackupJob — logical backup already completed', [
+                    'attempt_group_id' => $this->context->attemptGroupId,
+                    'backup_id'        => $backup->id,
+                ]);
+                return;
+            }
+
             if (! $backup->wasRecentlyCreated) {
                 // A retry of an already-attempted logical backup: reset the
                 // transient state left by the previous (failed) attempt so
@@ -150,7 +165,14 @@ class RunBackupJob implements ShouldQueue
             $preflightChecker->check();
 
             $extension = $encryption->name() !== 'none' ? 'sql.gz.enc' : 'sql.gz';
-            $path      = $pathBuilder->build($this->context, $startedAt, $extension);
+            // Built from $backup->started_at (the ORIGINAL attempt's start,
+            // untouched by the retry-reset above), not the local $startedAt
+            // (this attempt's start) — every retry of the same logical
+            // backup must resolve to the exact same remote key so a crash
+            // between "object written" and "row finalized" leaves a
+            // deterministically-findable object instead of an orphan at a
+            // path no later attempt will ever look at again.
+            $path      = $pathBuilder->build($this->context, CarbonImmutable::instance($backup->started_at), $extension);
             $backup->forceFill([
                 'path'           => $path,
                 'retention_tier' => $classifier->classify($startedAt)->value,

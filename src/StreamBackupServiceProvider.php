@@ -6,6 +6,7 @@ namespace Ahmednour\StreamBackup;
 
 use Ahmednour\StreamBackup\Commands\BackupAllCommand;
 use Ahmednour\StreamBackup\Commands\BackupCleanupCommand;
+use Ahmednour\StreamBackup\Commands\BackupReconcileCommand;
 use Ahmednour\StreamBackup\Commands\BackupTenantCommand;
 use Ahmednour\StreamBackup\Commands\RestoreBackupCommand;
 use Ahmednour\StreamBackup\Compression\AutoCompressionDriver;
@@ -28,6 +29,7 @@ use Ahmednour\StreamBackup\Dumpers\DumperFactory;
 use Ahmednour\StreamBackup\Exceptions\InvalidConfigException;
 use Ahmednour\StreamBackup\Jobs\AbortStaleMultipartUploads;
 use Ahmednour\StreamBackup\Jobs\BackupCleanupJob;
+use Ahmednour\StreamBackup\Jobs\ReconcileBackupsJob;
 use Ahmednour\StreamBackup\Pipelines\RestorePipeline;
 use Ahmednour\StreamBackup\Pipelines\StreamPipeline;
 use Ahmednour\StreamBackup\Resolvers\ConfigTenantResolver;
@@ -35,6 +37,7 @@ use Ahmednour\StreamBackup\Resolvers\SingleDatabaseResolver;
 use Ahmednour\StreamBackup\Restore\SqlDumpParser;
 use Ahmednour\StreamBackup\Restore\TableRestorer;
 use Ahmednour\StreamBackup\Support\BackupPathBuilder;
+use Ahmednour\StreamBackup\Support\BackupReconciler;
 use Ahmednour\StreamBackup\Support\BackupSemaphore;
 use Ahmednour\StreamBackup\Support\BackupVerifier;
 use Ahmednour\StreamBackup\Support\BinaryLocator;
@@ -101,6 +104,7 @@ class StreamBackupServiceProvider extends ServiceProvider
         });
 
         $this->app->singleton(BackupVerifier::class);
+        $this->app->singleton(BackupReconciler::class);
 
         // Compression driver switch
         $this->app->bind(CompressionDriver::class, function ($app) {
@@ -318,6 +322,7 @@ class StreamBackupServiceProvider extends ServiceProvider
                 BackupTenantCommand::class,
                 BackupAllCommand::class,
                 BackupCleanupCommand::class,
+                BackupReconcileCommand::class,
                 RestoreBackupCommand::class,
             ]);
         }
@@ -344,9 +349,14 @@ class StreamBackupServiceProvider extends ServiceProvider
             $cleanupEvent = $schedule->job(new BackupCleanupJob(), $queue, $connection);
             $this->applyFrequency($cleanupEvent, (array) $config->get('stream-backup.schedule.cleanup', []), 'cleanup');
 
+            $graceMinutes   = max(0, (int) $config->get('stream-backup.schedule.reconcile.grace_minutes', 30));
+            $reconcileEvent = $schedule->job(new ReconcileBackupsJob($graceMinutes), $queue, $connection);
+            $this->applyFrequency($reconcileEvent, (array) $config->get('stream-backup.schedule.reconcile', []), 'reconcile');
+
             if (is_string($timezone) && $timezone !== '') {
                 $staleEvent->timezone($timezone);
                 $cleanupEvent->timezone($timezone);
+                $reconcileEvent->timezone($timezone);
             }
         });
     }
@@ -360,6 +370,7 @@ class StreamBackupServiceProvider extends ServiceProvider
     private const VALID_FREQUENCIES = [
         'cleanup'         => ['daily', 'hourly', 'weekly', 'monthly', 'cron'],
         'stale_multipart' => ['hourly', 'everyMinutes', 'cron'],
+        'reconcile'       => ['hourly', 'everyMinutes', 'cron'],
     ];
 
     /**
