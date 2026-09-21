@@ -25,9 +25,31 @@ return [
         'password'    => env('STREAM_BACKUP_SFTP_PASSWORD'),
         'private_key' => env('STREAM_BACKUP_SFTP_PRIVATE_KEY'),  // absolute path to .pem
         'passphrase'  => env('STREAM_BACKUP_SFTP_PASSPHRASE'),
-        'visibility'  => 'public', // `private` = 0600, `public` = 0700
-        'directory_visibility' => 'public', // `private` = 0700, `public` = 0755
         'root'        => env('STREAM_BACKUP_SFTP_ROOT'),
+
+        // SFTP file/directory permissions — see SftpPermissionResolver and the
+        // README's "SFTP File & Directory Permissions" section for the full
+        // mapping and a migration note if you're upgrading from a version
+        // that defaulted to `visibility: public`.
+        //
+        // IMPORTANT: these are local Unix filesystem permissions on the SFTP
+        // server. They control which *local accounts on that server* can
+        // read/write the file — they do NOT make the file reachable over the
+        // network, and "public" below never means internet-accessible.
+        //
+        // Prefer the explicit octal modes — they map 1:1 onto `chmod` and
+        // can't be misread the way a visibility label can. Set as a string
+        // (e.g. '0640') so a leading zero survives env var round-tripping.
+        'file_mode'      => env('STREAM_BACKUP_SFTP_FILE_MODE'),      // e.g. '0640'; overrides `visibility` when set
+        'directory_mode' => env('STREAM_BACKUP_SFTP_DIRECTORY_MODE'), // e.g. '0750'; overrides `directory_visibility` when set
+
+        // Deprecated fallback, kept for backwards compatibility. Ignored
+        // when file_mode/directory_mode above is set.
+        //   'private' (default) => 0600 (files) / 0700 (directories) — owner-only.
+        //   'public'            => 0644 (files) / 0755 (directories) — group/world
+        //                          readable on the server's local filesystem only.
+        'visibility'           => env('STREAM_BACKUP_SFTP_VISIBILITY', 'private'),
+        'directory_visibility' => env('STREAM_BACKUP_SFTP_DIRECTORY_VISIBILITY', 'private'),
     ],
 
     /*

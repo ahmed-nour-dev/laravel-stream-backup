@@ -17,27 +17,24 @@ use phpseclib3\Net\SFTP;
 
 final class SftpChunkedUploader implements UploadDriver
 {
+    /**
+     * @param  int  $fileMode  chmod mode applied to every uploaded file (e.g. 0600).
+     *                         Resolve this via SftpPermissionResolver rather than
+     *                         hand-computing it from a visibility string.
+     * @param  int  $directoryMode  chmod mode applied to directories created on
+     *                              demand (e.g. 0700).
+     */
     public function __construct(
         private readonly SFTP $sftp,
         private readonly string $root = '',
-        private readonly string $visibility = 'public',
-        private readonly string $directoryVisibility = 'public'
+        private readonly int $fileMode = 0600,
+        private readonly int $directoryMode = 0700
     ) {}
 
     private function resolvePath(string $path): string
     {
         $path = ltrim($path, '/');
         return $this->root !== '' ? rtrim($this->root, '/') . '/' . $path : $path;
-    }
-
-    private function getFileMode(): int
-    {
-        return $this->visibility === 'private' ? 0600 : 0700;
-    }
-
-    private function getDirectoryMode(): int
-    {
-        return $this->directoryVisibility === 'private' ? 0700 : 0755;
     }
 
     private function ensureDirectoryExists(string $dir): void
@@ -47,7 +44,7 @@ final class SftpChunkedUploader implements UploadDriver
         }
 
         if (! $this->sftp->is_dir($dir)) {
-            $this->sftp->mkdir($dir, $this->getDirectoryMode(), true);
+            $this->sftp->mkdir($dir, $this->directoryMode, true);
         }
     }
 
@@ -77,7 +74,7 @@ final class SftpChunkedUploader implements UploadDriver
             throw new PipelineException("Cannot open remote path for writing: {$remotePath}");
         }
 
-        $this->sftp->chmod($this->getFileMode(), $remotePath);
+        $this->sftp->chmod($this->fileMode, $remotePath);
 
         // No uploadId — the open SSH channel IS the session
         return new SftpWriteSession($this->sftp, $remotePath, $metadata);
