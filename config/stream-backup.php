@@ -267,6 +267,18 @@ return [
     |       Hours a multipart upload may remain in 'Uploading' before it is
     |       considered stale and aborted. Floored at 1.
     |
+    |   reconcile.frequency:  'hourly' | 'everyMinutes' | 'cron'
+    |       - everyMinutes: uses `reconcile.minutes`
+    |                       (must divide 60 evenly: 1,2,3,4,5,6,10,12,15,20,30,60)
+    |       - cron:         uses `reconcile.cron` (raw expression)
+    |
+    |   reconcile.grace_minutes:
+    |       Minutes a non-completed backup's row must sit untouched before
+    |       ReconcileBackupsJob will inspect its remote object. Keeps the
+    |       sweep from racing a worker that is still actively uploading.
+    |       See BackupReconciler and the "Idempotent Completion &
+    |       Reconciliation" section of the README.
+    |
     |   queue / connection (nullable):
     |       If set, the scheduled cleanup jobs are pushed onto this
     |       queue/connection. Leave null to use the app's default queue on
@@ -293,6 +305,13 @@ return [
             'minutes'     => (int) env('STREAM_BACKUP_STALE_MINUTES', 60),
             'cron'        => env('STREAM_BACKUP_STALE_CRON'),
             'stale_hours' => max(1, (int) env('STREAM_BACKUP_STALE_HOURS', 6)),
+        ],
+
+        'reconcile' => [
+            'frequency'     => env('STREAM_BACKUP_RECONCILE_FREQUENCY', 'hourly'),
+            'minutes'       => (int) env('STREAM_BACKUP_RECONCILE_MINUTES', 60),
+            'cron'          => env('STREAM_BACKUP_RECONCILE_CRON'),
+            'grace_minutes' => max(0, (int) env('STREAM_BACKUP_RECONCILE_GRACE_MINUTES', 30)),
         ],
     ],
 
