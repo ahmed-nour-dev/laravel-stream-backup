@@ -388,6 +388,23 @@ php -r "echo base64_encode(random_bytes(32));"
 
 > ⚠️ **WARNING**: Losing the encryption key makes ALL encrypted backups permanently unrecoverable. Store it in AWS Secrets Manager, HashiCorp Vault, or an equivalent secrets manager. This package will never generate, store, or log key material.
 
+## Full Checksum Verification
+
+`verify_after_upload` (default `true`) runs a cheap post-upload sanity check: the remote object exists, its size matches, and its first few bytes look right (gzip magic number, or the encryption driver's version byte). That check does **not** prove every byte on the remote object matches what was streamed — a bit flip in the middle of a multi-gigabyte object would pass it.
+
+Setting `full_checksum_verification` to `true` (env: `STREAM_BACKUP_FULL_CHECKSUM_VERIFICATION`) adds that stronger guarantee. It compares the SHA-256 `ChecksumStream` computed over the compressed/encrypted bytes while they were being streamed up against the actual remote object content, after `verify_after_upload`'s checks pass:
+
+- **S3 / S3-compatible destinations**: a server-side full-object SHA-256 checksum is used when the provider returns one — no download needed. This is a best-effort fast path: the default checksum type for an S3 multipart upload is `COMPOSITE` (a hash of each part's checksum, not of the object's bytes), which is never directly comparable to the whole-stream SHA-256 `ChecksumStream` records, so it's deliberately ignored. Most S3-compatible providers don't return a directly comparable (`FULL_OBJECT`) checksum for a multipart upload today.
+- **Everything else — SFTP, local disk, or S3 whenever it can't produce a directly comparable checksum**: the remote object is streamed back through the same `DownloadDriver` the restore pipeline uses and hashed in bounded-memory chunks. It is never buffered whole, but it **is** a full second read of the object over the network (S3/SFTP) or disk (local).
+
+Because that fallback re-reads the entire object, enabling this for large backups has a real bandwidth/time cost — that's why it's opt-in and defaults to `false`. A checksum mismatch fails the backup exactly like a size or magic-byte mismatch does: `BackupStatus::Failed` with a clear `error_message`.
+
+```php
+// config/stream-backup.php
+'verify_after_upload'        => true,
+'full_checksum_verification' => true,
+```
+
 ## Configuration overview
 
 | Key | Default | Purpose |
@@ -413,6 +430,7 @@ php -r "echo base64_encode(random_bytes(32));"
 | `timeouts.max_runtime` | 21 600 s (6 h) | Hard ceiling on total backup runtime (dump+compress+upload). `0` disables it. Overridable per tenant via `tenants[].timeout` |
 | `timeouts.idle_timeout` | 900 s (15 m) | Aborts a backup that stops making forward progress (stalled dump/compressor/upload) even though the worker is still alive. `0` disables it |
 | `verify_after_upload` | `true` | Validates object size + gzip magic bytes after completion |
+| `full_checksum_verification` | `false` | Opt-in: compares the remote object's content against the SHA-256 recorded during streaming. Prefers a server-side S3 checksum; falls back to a bounded-memory streaming re-download otherwise. Only takes effect when `verify_after_upload` is also `true` — see [Full Checksum Verification](#full-checksum-verification) |
 | `auto_schedule` | `true` | Auto-register cleanup/stale-abort on Laravel scheduler |
 | `schedule.cleanup.frequency` | `daily` | Cleanup job cadence |
 | `schedule.cleanup.time` | `03:15` | HH:MM (24h) for daily/weekly/monthly cleanup |
@@ -589,12 +607,16 @@ MySQL dump + restore integration coverage already lives in the fast matrix (`tes
 
 ## Changelog
 
-### v1.6.0
+### v1.7.0
 - Idempotent completion: a logical backup's remote object key is now derived from the original attempt's `started_at`, so every retry of the same `attempt_group_id` targets the exact same remote path instead of orphaning the previous attempt's object
 - `RunBackupJob` is now a no-op for a duplicate/late delivery of an already-`Completed` logical backup — it never resets or re-uploads a finalized backup
 - New `BackupReconciler` + scheduled `ReconcileBackupsJob` detect and recover from a crash between "the remote object finished uploading" and "the database row was marked Completed", using an atomic compare-and-swap so a concurrently-finishing worker can never be overwritten
 - New `php artisan backup:reconcile` command (`--grace`, `--clean`, `--queue`) for ad hoc diagnosis and orphaned-object cleanup
 - See [Idempotent Completion & Remote-Object Reconciliation](#idempotent-completion--remote-object-reconciliation)
+
+### v1.6.0
+- New opt-in `full_checksum_verification` config option: compares the remote backup's content against the SHA-256 recorded during streaming, instead of only checking size and magic bytes — see [Full Checksum Verification](#full-checksum-verification)
+- S3 destinations prefer a server-side full-object checksum when the provider returns one; every destination falls back to a bounded-memory streaming re-download otherwise
 
 ### v1.5.0
 - Restore statement splitting is now delimiter-aware (`DelimiterAwareStatementReader`): stored procedures, functions, triggers and events with internal semicolons — and their `DELIMITER $$ ... DELIMITER ;` wrapper — restore as single statements instead of being chopped on every line-ending `;`
