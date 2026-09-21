@@ -528,6 +528,21 @@ vendor/bin/phpunit --testsuite Integration
 | S3-compatible / MinIO (`sqlite3` + `gzip` on PATH) | `STREAM_BACKUP_TEST_S3_ENDPOINT` / `_KEY` / `_SECRET` / `_BUCKET` / `_REGION` |
 | SFTP (`sqlite3` + `gzip` on PATH) | `STREAM_BACKUP_TEST_SFTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_ROOT` |
 
+### Performance tests
+
+`tests/Performance` is a separate PHPUnit testsuite that guards the package's core promise — constant-memory streaming — as a measurable regression test rather than a documentation claim. It drives the real `StreamPipeline` end-to-end (real dump/compressor subprocesses, real encryption/checksum stream decorators, a real `LocalDiskUploader`) against a deterministic, quasi-random synthetic dump generated on the fly by `tests/Performance/Support/generate_synthetic_dump.php`, so no multi-gigabyte fixture is ever checked into the repository. It asserts:
+
+- peak PHP memory growth stays under the same fixed ceiling at both a small and a ~24x larger input size, proving memory does not grow with stream size (the primary acceptance criterion — not a rigid absolute number);
+- the same bound holds with encryption enabled (`openssl-aes-256-gcm`) and with compression swapped for an identity passthrough;
+- total bytes streamed, throughput, and multipart chunk/part count are recorded, with a flake-tolerant throughput floor that only catches a catastrophic (not CI-runner-variance-sized) slowdown;
+- a best-effort whole-process RSS growth check via `/proc/self/status`, skipped where unavailable.
+
+Like `tests/Integration`, it is excluded from a plain `vendor/bin/phpunit` run (`defaultTestSuite` stays pinned to `Unit,Feature`) and from the fast matrix's `tests.yml` workflow; it runs as its own `performance` GitHub Actions job:
+
+```bash
+vendor/bin/phpunit --testsuite Performance
+```
+
 MySQL dump + restore integration coverage already lives in the fast matrix (`tests.yml`) against a real `mysql:8.0` service — see `STREAM_BACKUP_TEST_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` above.
 
 ## Changelog
