@@ -176,6 +176,7 @@ Then:
 php artisan backup:all                     # enqueue every tenant
 php artisan backup:tenant 1                # single tenant by id
 php artisan backup:cleanup                 # apply retention policy
+php artisan backup:reconcile               # recover backups stuck between upload and finalization
 ```
 
 ### Restore
@@ -251,15 +252,17 @@ public function boot(): void
 
 `auto_schedule` (enabled by default) registers:
 
-- `stream-backup:abort-stale-multipart` — aborts orphaned multipart uploads on the bucket
-- `stream-backup:cleanup` — prunes old backups per retention tier
+- `AbortStaleMultipartUploads` — aborts orphaned multipart uploads on the bucket
+- `BackupCleanupJob` — prunes old backups per retention tier
+- `ReconcileBackupsJob` — finalizes backups stuck between "remote object written" and "database marked Completed"; see [Idempotent Completion & Remote-Object Reconciliation](#idempotent-completion--remote-object-reconciliation)
 
-Both jobs support configurable frequencies via config or env vars:
+All three jobs support configurable frequencies via config or env vars:
 
 | Job | Supported Frequencies | Default |
 |---|---|---|
 | `cleanup` | `daily`, `hourly`, `weekly`, `monthly`, `cron` | `daily` at `03:15` |
 | `stale_multipart` | `hourly`, `everyMinutes`, `cron` | `hourly` |
+| `reconcile` | `hourly`, `everyMinutes`, `cron` | `hourly` |
 
 Invalid frequency values throw `InvalidConfigException` at boot time so typos surface immediately.
 
@@ -294,6 +297,76 @@ $backup->attempts; // every execution, oldest first (Illuminate\Support\Collecti
 A backup that succeeded on its second try shows up as one `backups` row
 with `status = completed`, and two `backup_attempts` rows: attempt 1
 `failed` with its `error_message`, attempt 2 `completed`.
+
+### Idempotent Completion & Remote-Object Reconciliation
+
+A worker can crash (SIGKILL, OOM, a database connection drop) at the exact
+moment *after* the remote object has been fully written but *before* the
+`backups` row is marked `Completed`. Without special handling that leaves
+two problems: the retry that follows re-uploads to a brand new path
+(orphaning the object the crashed attempt already paid for), and the row
+sits reporting `Uploading`/`Failed` forever even though the backup is
+actually fine.
+
+**Deterministic remote path.** The object key for a logical backup is
+built from `started_at` on its `backups` row — set once, on the *first*
+attempt, and never touched by a retry-reset. Every retry of the same
+`attempt_group_id` therefore resolves to the exact same S3 key / SFTP
+path / local file, and every uploader (`S3MultipartUploader`,
+`SftpChunkedUploader`, `LocalDiskUploader`) truncates on open — so a
+retry safely overwrites a half-written object from a crashed attempt
+instead of leaving it behind at a path nothing will ever look at again.
+
+**Idempotent finalization.** If `RunBackupJob` is delivered again for a
+logical backup that is already `Completed` (a duplicate queue delivery,
+a manual re-dispatch), it logs and returns immediately instead of
+resetting and re-running the pipeline — a Completed backup's remote
+object is never overwritten by a stale retry.
+
+**Crash recovery.** `BackupReconciler` (`src/Support/BackupReconciler.php`)
+closes the remaining gap — a crash between the upload finishing and the
+row being marked `Completed`, with no further retry ever scheduled (tries
+exhausted, or the whole job payload lost). For a non-Completed row with a
+`path`, it inspects the remote object directly:
+
+| It finds... | Outcome | Effect |
+|---|---|---|
+| No object at `path` | `NoRemoteObject` | Row is left alone — the backup genuinely never finished. |
+| An object whose size matches (or no size was ever recorded) and passes the usual magic-byte check | `Finalized` | Row is atomically moved to `Completed` (`UPDATE ... WHERE status != 'completed'`, so a live worker finishing the same row at the same moment always wins the race). |
+| A 0-byte object, or one whose size disagrees with what was recorded | `SizeMismatch` | Row is left alone; flagged as an orphan candidate. |
+| An object that fails magic-byte verification | `VerificationFailed` | Row is left alone; flagged as an orphan candidate. |
+| Already `Completed` | `AlreadyCompleted` | No-op — reconciling the same row twice is always safe. |
+
+`ReconcileBackupsJob` runs this sweep on a schedule (`stream-backup.schedule.reconcile`,
+hourly by default) over every non-Completed row whose `path` is set and
+whose `updated_at` is older than `grace_minutes` (default 30) — the grace
+period is what keeps the sweep from racing a worker that is still actively
+uploading.
+
+For ad hoc diagnosis, or to delete a confirmed-orphaned remote object:
+
+```bash
+# Report only — never deletes anything.
+php artisan backup:reconcile
+
+# Same sweep, but delete the remote object for any row that came back
+# size_mismatch or verification_failed.
+php artisan backup:reconcile --clean
+
+# Dispatch to the queue instead of running (and printing a table) synchronously.
+php artisan backup:reconcile --queue
+
+# Only inspect rows idle for at least this many minutes.
+php artisan backup:reconcile --grace=60
+```
+
+`BackupReconciler::cleanupOrphan()` is never called automatically — deleting
+remote data always requires the explicit `--clean` flag or a direct call,
+never a scheduled job acting alone.
+
+> **Note:** this closes the gap for a single logical backup's *own* remote
+> object. It does not scan a bucket for unrelated files — orphan detection
+> is scoped to paths this package itself recorded in `backups.path`.
 
 ## Encryption
 
@@ -363,6 +436,8 @@ Because that fallback re-reads the entire object, enabling this for large backup
 | `schedule.cleanup.time` | `03:15` | HH:MM (24h) for daily/weekly/monthly cleanup |
 | `schedule.stale_multipart.frequency` | `hourly` | Stale multipart abort cadence |
 | `schedule.stale_multipart.stale_hours` | `6` | Hours before a multipart upload is considered stale |
+| `schedule.reconcile.frequency` | `hourly` | Reconciliation sweep cadence — see [Idempotent Completion & Remote-Object Reconciliation](#idempotent-completion--remote-object-reconciliation) |
+| `schedule.reconcile.grace_minutes` | `30` | Minutes a non-completed backup must be idle before the sweep will inspect its remote object |
 | `restore.strip_definers` | `true` | Strips `DEFINER=` clauses from restored DDL (avoids error 1227 on managed MySQL) |
 | `restore.skip_on_error` | `false` | Fail-fast by default: any restore SQL error aborts the run. Set `true` to swallow `skippable_error_codes` and continue best-effort instead |
 | `restore.skippable_error_codes` | `[1227]` | MySQL error codes ignored when `skip_on_error` is `true`. Only used if `skip_on_error` is enabled |
@@ -531,6 +606,13 @@ vendor/bin/phpunit --testsuite Integration
 MySQL dump + restore integration coverage already lives in the fast matrix (`tests.yml`) against a real `mysql:8.0` service — see `STREAM_BACKUP_TEST_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` above.
 
 ## Changelog
+
+### v1.7.0
+- Idempotent completion: a logical backup's remote object key is now derived from the original attempt's `started_at`, so every retry of the same `attempt_group_id` targets the exact same remote path instead of orphaning the previous attempt's object
+- `RunBackupJob` is now a no-op for a duplicate/late delivery of an already-`Completed` logical backup — it never resets or re-uploads a finalized backup
+- New `BackupReconciler` + scheduled `ReconcileBackupsJob` detect and recover from a crash between "the remote object finished uploading" and "the database row was marked Completed", using an atomic compare-and-swap so a concurrently-finishing worker can never be overwritten
+- New `php artisan backup:reconcile` command (`--grace`, `--clean`, `--queue`) for ad hoc diagnosis and orphaned-object cleanup
+- See [Idempotent Completion & Remote-Object Reconciliation](#idempotent-completion--remote-object-reconciliation)
 
 ### v1.6.0
 - New opt-in `full_checksum_verification` config option: compares the remote backup's content against the SHA-256 recorded during streaming, instead of only checking size and magic bytes — see [Full Checksum Verification](#full-checksum-verification)
