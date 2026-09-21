@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ahmednour\StreamBackup\Support;
 
+use Ahmednour\StreamBackup\Contracts\DownloadDriver;
 use Ahmednour\StreamBackup\Contracts\VerifiesMagicBytes;
 use Ahmednour\StreamBackup\Encryption\EncryptionFactory;
 use Ahmednour\StreamBackup\Models\Backup;
@@ -16,6 +17,12 @@ use phpseclib3\Net\SFTP;
  * Post-upload sanity check: the remote object exists, its size matches what we
  * streamed, and the first two bytes are the gzip magic number (0x1f 0x8b).
  * Catches silent backup corruption before it becomes a restore-time disaster.
+ *
+ * When `stream-backup.full_checksum_verification` is enabled, a stronger
+ * check runs afterwards: the SHA-256 recorded by ChecksumStream during
+ * upload is compared against the remote object's actual content, preferring
+ * a server-side S3 checksum over downloading the object. See
+ * verifyFullChecksum().
  */
 final class BackupVerifier
 {
@@ -123,6 +130,109 @@ final class BackupVerifier
         if ($length > 0 && $encryptionDriver instanceof VerifiesMagicBytes) {
             $encryptionDriver->verifyMagicBytes($magic, $backup);
         }
+
+        if ((bool) $this->config->get('stream-backup.full_checksum_verification', false)) {
+            $this->verifyFullChecksum($backup, $driverName);
+        }
+    }
+
+    /**
+     * Proves every byte of the remote object matches the checksum recorded
+     * during streaming, not just its length and first few bytes. Does
+     * nothing if no checksum was recorded (e.g. a driver that never set
+     * UploadResult::$checksum).
+     */
+    private function verifyFullChecksum(Backup $backup, string $driverName): void
+    {
+        $expected = strtolower((string) $backup->checksum);
+
+        if ($expected === '') {
+            return;
+        }
+
+        $remote = $driverName === 's3' ? $this->s3FullObjectChecksum($backup) : null;
+        $method = 'S3 server-side checksum';
+
+        if ($remote === null) {
+            $remote = $this->streamRemoteChecksum($backup);
+            $method = 'streaming remote read';
+        }
+
+        if (! hash_equals($expected, strtolower($remote))) {
+            throw new \RuntimeException(sprintf(
+                'Backup checksum mismatch for %s (via %s): expected=%s actual=%s',
+                $backup->path,
+                $method,
+                $expected,
+                $remote,
+            ));
+        }
+    }
+
+    /**
+     * Asks S3 for a server-side SHA-256 checksum of the whole object without
+     * downloading it. Only trusted when the provider reports
+     * ChecksumType=FULL_OBJECT: the default for a multipart upload is
+     * COMPOSITE, a hash of the individual parts' checksums rather than of
+     * the object's bytes, which is never directly comparable to the plain
+     * whole-stream SHA-256 ChecksumStream records. Returns null (falls back
+     * to streamRemoteChecksum()) whenever no directly-comparable checksum
+     * is available — most S3-compatible providers, today, for a multipart
+     * upload.
+     */
+    private function s3FullObjectChecksum(Backup $backup): ?string
+    {
+        $s3 = $this->container->make(S3ClientInterface::class);
+
+        try {
+            $head = $s3->headObject([
+                'Bucket'       => $this->bucket($backup),
+                'Key'          => $backup->path,
+                'ChecksumMode' => 'ENABLED',
+            ]);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        if (($head['ChecksumType'] ?? null) !== 'FULL_OBJECT') {
+            return null;
+        }
+
+        $encoded = $head['ChecksumSHA256'] ?? null;
+        if (! is_string($encoded) || $encoded === '') {
+            return null;
+        }
+
+        $raw = base64_decode($encoded, true);
+
+        return $raw !== false && strlen($raw) === 32 ? bin2hex($raw) : null;
+    }
+
+    /**
+     * Streams the remote object back through the configured DownloadDriver
+     * and hashes it in bounded-memory chunks — the object is never
+     * buffered whole, regardless of size.
+     */
+    private function streamRemoteChecksum(Backup $backup): string
+    {
+        $stream    = $this->container->make(DownloadDriver::class)->download((string) $backup->path);
+        $chunkSize = (int) $this->config->get('stream-backup.read_chunk', 64 * 1024);
+
+        $hash = hash_init('sha256');
+
+        try {
+            while (($chunk = $stream->read($chunkSize)) !== null) {
+                if ($chunk === '') {
+                    usleep(1_000);
+                    continue;
+                }
+                hash_update($hash, $chunk);
+            }
+        } finally {
+            $stream->close();
+        }
+
+        return hash_final($hash);
     }
 
     private function bucket(Backup $backup): string

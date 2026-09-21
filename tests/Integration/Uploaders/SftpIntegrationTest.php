@@ -6,6 +6,7 @@ namespace Ahmednour\StreamBackup\Tests\Integration\Uploaders;
 
 use Ahmednour\StreamBackup\DTOs\BackupContext;
 use Ahmednour\StreamBackup\Enums\BackupStatus;
+use Ahmednour\StreamBackup\Support\BackupVerifier;
 use Ahmednour\StreamBackup\Tests\Support\BuildsIntegrationBackups;
 use Ahmednour\StreamBackup\Tests\TestCase;
 use Illuminate\Support\Facades\DB;
@@ -111,6 +112,66 @@ final class SftpIntegrationTest extends TestCase
 
         $plaintext = $this->downloadAndDecompress($backup);
         self::assertStringContainsString('sbr-sftp-round-trip-marker', $plaintext);
+    }
+
+    /**
+     * SFTP has no server-side checksum facility, so enabling full checksum
+     * verification always exercises BackupVerifier's streaming-download
+     * fallback against a real SFTP server — proving it can stream a whole
+     * object back in bounded-memory chunks and still match the checksum
+     * recorded during upload.
+     */
+    public function test_full_checksum_verification_passes_against_a_real_sftp_service(): void
+    {
+        $this->app['config']->set('stream-backup.full_checksum_verification', true);
+
+        $context = new BackupContext(
+            tenantId:       null,
+            // Distinct databaseName from the round-trip tests above/below:
+            // BackupPathBuilder's path only has second-level timestamp
+            // precision, and SftpChunkedUploader::initiate() opens the
+            // remote path with SFTP::RESUME (append, not truncate) — two
+            // tests landing on the identical path in the same second would
+            // silently concatenate their content instead of overwriting it.
+            databaseName:   'sbr_sftp_it_db_checksum_match',
+            connectionName: 'sqlite_sftp_it',
+            disk:           'sftp_unused',
+            driver:         'sqlite',
+        );
+
+        $backup = $this->runBackupSync($context);
+
+        self::assertSame(BackupStatus::Completed, $backup->status, (string) $backup->error_message);
+        self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/', (string) $backup->checksum);
+    }
+
+    /**
+     * A corrupted recorded checksum must be caught by full verification —
+     * re-running BackupVerifier against the same, untouched remote object
+     * with a deliberately wrong expected checksum proves the mismatch path
+     * actually compares against real remote content, not a mocked one.
+     */
+    public function test_full_checksum_verification_detects_a_checksum_mismatch_against_a_real_sftp_service(): void
+    {
+        $this->app['config']->set('stream-backup.full_checksum_verification', true);
+
+        $context = new BackupContext(
+            tenantId:       null,
+            databaseName:   'sbr_sftp_it_db_checksum_mismatch',
+            connectionName: 'sqlite_sftp_it',
+            disk:           'sftp_unused',
+            driver:         'sqlite',
+        );
+
+        $backup = $this->runBackupSync($context);
+        self::assertSame(BackupStatus::Completed, $backup->status, (string) $backup->error_message);
+
+        $backup->forceFill(['checksum' => str_repeat('0', 64)])->save();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Backup checksum mismatch');
+
+        $this->app->make(BackupVerifier::class)->verify($backup);
     }
 
     public function test_encrypted_backup_round_trips_through_a_real_sftp_service(): void
