@@ -119,6 +119,10 @@ STREAM_BACKUP_SFTP_USERNAME=
 STREAM_BACKUP_SFTP_PASSWORD=
 STREAM_BACKUP_SFTP_PRIVATE_KEY=              # absolute path to .pem
 STREAM_BACKUP_SFTP_ROOT=
+STREAM_BACKUP_SFTP_FILE_MODE=                # e.g. 0640 — see "SFTP File & Directory Permissions"
+STREAM_BACKUP_SFTP_DIRECTORY_MODE=           # e.g. 0750
+STREAM_BACKUP_SFTP_VISIBILITY=private        # deprecated: private | public (ignored when FILE_MODE is set)
+STREAM_BACKUP_SFTP_DIRECTORY_VISIBILITY=private  # deprecated: private | public (ignored when DIRECTORY_MODE is set)
 
 # Schedule customisation
 STREAM_BACKUP_AUTO_SCHEDULE=true
@@ -146,6 +150,25 @@ The bundled S3 client is configured with:
 ```
 
 These two flags are **mandatory** for Spaces — without them `completeMultipartUpload` fails with `MalformedXML` because Spaces does not implement the SDK's new default checksum headers.
+
+### SFTP File & Directory Permissions
+
+`SftpChunkedUploader` `chmod`s every backup file it uploads and every directory it creates on the SFTP server. These are **local Unix filesystem permissions on the SFTP server** — they control which local accounts on that server can read or write the file. They have **nothing to do with whether the file is reachable over the network or the internet**; that is entirely determined by whether the SFTP server itself is exposed, and to whom. A file `chmod`ed `0644` is still completely unreachable to the internet if the SFTP server isn't listening on a public interface, and a file `chmod`ed `0600` offers no protection at all if the server itself is compromised or misconfigured.
+
+Two ways to configure this, resolved by `SftpPermissionResolver`:
+
+1. **`destination.file_mode` / `destination.directory_mode`** (recommended) — explicit octal `chmod` modes, e.g. `'0640'` / `'0750'`. These map 1:1 onto `chmod` with no naming ambiguity. Set them as strings (`STREAM_BACKUP_SFTP_FILE_MODE=0640`) so a leading zero survives env var round-tripping.
+
+2. **`destination.visibility` / `destination.directory_visibility`** — kept for backwards compatibility, ignored once the corresponding `_mode` key above is set. Despite the flysystem-style naming, `public` here **never** means "reachable over the internet":
+
+   | Value | File mode | Directory mode |
+   |---|---|---|
+   | `private` (default) | `0600` (owner read/write only) | `0700` (owner-only) |
+   | `public` | `0644` (owner read/write, group/world read) | `0755` (group/world read+traverse) |
+
+Both settings default to `private` — least-privilege by default. An invalid value for either raises `InvalidConfigException` at upload time instead of silently falling back to something insecure.
+
+**Migrating from an older version:** prior releases mapped `visibility: public` (the old default) to file mode `0700` — owner read/write/execute, no group/world access at all, despite the "public" label. That default was both confusingly named and stricter than typical "public" semantics. If your deployment relies on the old `public` file mode being `0700`, pin it explicitly with `STREAM_BACKUP_SFTP_FILE_MODE=0700`; otherwise the new default (`private` → `0600`) is at least as restrictive and requires no change.
 
 ## Usage
 
@@ -411,6 +434,10 @@ Because that fallback re-reads the entire object, enabling this for large backup
 |---|---|---|
 | `default_disk` | `spaces` | Filesystem disk; must be S3-compatible when using S3 driver |
 | `destination.driver` | `s3` | `s3`, `sftp`, or `local` |
+| `destination.file_mode` | — | SFTP only: explicit octal `chmod` mode for uploaded files (e.g. `'0640'`). Overrides `visibility` when set — see [SFTP File & Directory Permissions](#sftp-file--directory-permissions) |
+| `destination.directory_mode` | — | SFTP only: explicit octal `chmod` mode for created directories (e.g. `'0750'`). Overrides `directory_visibility` when set |
+| `destination.visibility` | `private` | SFTP only, deprecated in favor of `file_mode`: `private` → `0600`, `public` → `0644`. Neither makes the file internet-accessible — see [SFTP File & Directory Permissions](#sftp-file--directory-permissions) |
+| `destination.directory_visibility` | `private` | SFTP only, deprecated in favor of `directory_mode`: `private` → `0700`, `public` → `0755` |
 | `dump.driver` | `auto` | `auto`, `mysql`, `pgsql`, `sqlite`, or custom |
 | `dump.drivers.mysql.binary` | `mysqldump` | Path/name of the mysqldump binary |
 | `dump.drivers.pgsql.binary` | `pg_dump` | Path/name of the pg_dump binary |
@@ -621,6 +648,11 @@ vendor/bin/phpunit --testsuite Performance
 MySQL dump + restore integration coverage already lives in the fast matrix (`tests.yml`) against a real `mysql:8.0` service — see `STREAM_BACKUP_TEST_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` above.
 
 ## Changelog
+
+### v1.8.0
+- Fixed a confusing/insecure SFTP permission default: `visibility: public` previously produced file mode `0700` (owner-only, no group/world access at all) despite the "public" name — see [SFTP File & Directory Permissions](#sftp-file--directory-permissions)
+- New explicit `destination.file_mode` / `destination.directory_mode` config options (e.g. `'0640'` / `'0750'`), resolved by `SftpPermissionResolver`; these take precedence over `visibility` / `directory_visibility` when set
+- `destination.visibility` / `destination.directory_visibility` now default to `private` (least-privilege: `0600` files / `0700` directories) instead of `public`, and an invalid value now raises `InvalidConfigException` instead of silently mapping to `public`
 
 ### v1.7.0
 - Idempotent completion: a logical backup's remote object key is now derived from the original attempt's `started_at`, so every retry of the same `attempt_group_id` targets the exact same remote path instead of orphaning the previous attempt's object

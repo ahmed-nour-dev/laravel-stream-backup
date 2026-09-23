@@ -43,6 +43,7 @@ use Ahmednour\StreamBackup\Support\BackupVerifier;
 use Ahmednour\StreamBackup\Support\BinaryLocator;
 use Ahmednour\StreamBackup\Support\MySQLCredentialFile;
 use Ahmednour\StreamBackup\Support\RetentionClassifier;
+use Ahmednour\StreamBackup\Support\SftpPermissionResolver;
 use Ahmednour\StreamBackup\Uploaders\LocalDiskUploader;
 use Ahmednour\StreamBackup\Uploaders\S3MultipartUploader;
 use Ahmednour\StreamBackup\Uploaders\SftpChunkedUploader;
@@ -205,11 +206,13 @@ class StreamBackupServiceProvider extends ServiceProvider
                         );
                     }
 
+                    [$fileMode, $directoryMode] = SftpPermissionResolver::resolve($cfg);
+
                     return new SftpChunkedUploader(
                         $sftp,
                         (string) ($cfg['root'] ?? ''),
-                        (string) ($cfg['visibility'] ?? 'public'),
-                        (string) ($cfg['directory_visibility'] ?? 'public')
+                        $fileMode,
+                        $directoryMode
                     );
                 })(),
 
