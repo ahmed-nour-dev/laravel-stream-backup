@@ -2,17 +2,52 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## v1.7.0 (2026-10-11)
+
+This release adds restore support for PostgreSQL and SQLite. `backup:restore` now handles every database that backup supports, restoring into a connection of the same engine. Restore is also driver-aware, so a backup that can't be restored fails before anything is downloaded.
+
+**Upgrading from v1.6.0:** there are no new migrations and no changed defaults. MySQL restore behaves as before. Read the [upgrade notes](#upgrade-notes-for-v170) if you restore backups made before v1.6.0 or register custom dump drivers.
 
 ### New features
 
-- **SQLite restore.** `backup:restore` now restores `sqlite3 .dump` backups into a SQLite connection, in full or with `--tables`. Both drop and recreate the dumped tables inside one transaction, so a failure leaves the database file as it was, and tables not in the dump are left alone. Indexes, triggers, views and `AUTOINCREMENT` sequence values are restored. Foreign keys are checked before commit if they were enforced, and a foreign key crossing the restore set is refused. The issue proposed building a new file and swapping it in for full restores; the transaction avoids losing concurrent writes, stale open connections and dropping unrelated tables (#40).
-- **PostgreSQL restore.** `backup:restore` now restores plain-format `pg_dump` backups into a PostgreSQL connection, including selective `--tables` restores. The whole restore runs in one transaction, so a failure leaves the database as it was. `COPY` data is streamed in bounded batches through PDO's `copyFromArray()`. Constraints, indexes and foreign keys are added after all data is loaded, so cyclic foreign keys work. A selective restore refuses foreign keys that cross the restore boundary, like MySQL. Sequences (including identity columns), non-`public` schemas and table comments are handled. Functions, types, views, extensions, ownership and privileges are not restored (#40).
+- **PostgreSQL restore.** `backup:restore` restores plain-format `pg_dump` backups (`-F p`) into a PostgreSQL connection, in full or with `--tables`.
+  - The whole restore runs in one transaction. PostgreSQL DDL is transactional, so a failure rolls back the drops, new tables and loaded data and leaves the database as it was. There are no shadow tables.
+  - `COPY` data is streamed through PDO's `copyFromArray()` (`pgsqlCopyFromArray()` before PHP 8.4) in batches of up to 1,000 rows or 4 MB, so memory stays bounded. Piping to `psql` was rejected because it uses a second connection that can't join the transaction.
+  - The restore runs in three stages across all tables: tables and data, then primary and unique keys, indexes and triggers, then foreign keys. No dependency ordering is needed and cyclic foreign keys work.
+  - Sequences (including identity columns, with `setval`), defaults, table and column comments, and tables in non-`public` schemas are restored. Name a non-`public` table `schema.table` in `--tables`.
+  - Functions, types, views, extensions, ownership and privileges (`OWNER TO`, `GRANT`, `REVOKE`) are not restored, and neither are sequences that no table owns. Tables are dropped without `CASCADE`, so a view that depends on a restored table aborts the restore.
+- **SQLite restore.** `backup:restore` restores `sqlite3 .dump` backups into a SQLite connection, in full or with `--tables`.
+  - Both modes drop and recreate the dumped tables inside one transaction, so a failure leaves the database file as it was. Tables that aren't in the dump, including this package's own tables when they share the file, are left alone.
+  - Indexes, triggers, views and `AUTOINCREMENT` sequence values are restored. Virtual tables are not.
+  - Foreign-key enforcement is switched off for the restore and put back afterwards. If it was on, the restored data is checked with `PRAGMA foreign_key_check` before commit, and a restore that would break a foreign key rolls back.
+  - The original proposal was to build a new database file and swap it in for full restores. The in-place transaction was chosen instead because a swap loses writes made during the restore, leaves open connections on the old file, and discards tables that aren't in the dump. The trade-off is that SQLite's write lock is held for the whole restore.
+- **Restore drivers.** A new `RestoreDriver` contract pairs a dump parser with a restorer. `RestoreDriverFactory` resolves it from the backup's recorded `dump_driver` and has an `extend()` hook like `DumperFactory`, so other packages can register restore support for further engines.
+- **Foreign-key boundary guard for every engine.** A restore that has a foreign key crossing the restore set (a restored table referenced by, or referencing, a table that isn't restored) is refused before anything is changed. PostgreSQL and SQLite apply this to full restores too, since dropping a table that another table still references would otherwise fail or break that table.
 
 ### Changes
 
-- **Restore is now driver-aware.** A new `RestoreDriver` contract pairs a dump parser with a restorer and is resolved from `backups.dump_driver` by `RestoreDriverFactory`, which has an `extend()` hook like `DumperFactory`. MySQL is the only built-in driver, and its behavior is unchanged. This is groundwork for PostgreSQL and SQLite restore (#40).
-- **Unsupported or mismatched restores fail before the download.** `RestorePipeline::run()` now raises `RestoreFailedException` up front when the backup's `dump_driver` has no restore driver, or doesn't match the target connection's driver. Backups with no recorded `dump_driver` are treated as mysqldump (MySQL).
+- **Unsupported or mismatched restores fail before the download.** `RestorePipeline::run()` raises `RestoreFailedException` up front when the backup's `dump_driver` has no restore driver, or doesn't match the target connection's driver. Previously the check ran after the backup had been downloaded, decrypted, decompressed and parsed. Cross-engine restore (for example a MySQL backup into PostgreSQL) is rejected this way.
+- `restore.skip_on_error`, `restore.atomic_restore` and `restore.strip_definers` apply to MySQL only. PostgreSQL and SQLite restores always fail fast and roll back, because a failed statement aborts the transaction.
+
+### Fixes
+
+- A MySQL backup is no longer rejected by the new driver check. `backups.dump_driver` holds the dump tool's name (`mysqldump`, `pg_dump`, `sqlite3`), and the check keys on exactly that. This was caught before release.
+
+### Documentation
+
+- The README support matrix, the Restore section (with PostgreSQL and SQLite restore notes), the `backup:restore` description and the config comments now describe restore for all three engines. The Roadmap lists what is not planned: cross-engine restore and `pg_dump` custom or directory formats (`-F c`, `-F d`).
+
+### Testing and CI
+
+- PostgreSQL restore runs against the existing `postgres:16` service in the Integration job: full restore, replacing tables, rollback on failure, the foreign-key guard, selective restore and a real `pg_dump` round trip.
+- SQLite restore runs through the full `RestorePipeline` against a real file-backed database in the default test suite, including gzip and AES-256-GCM encryption, and round-trips the real `sqlite3 .dump` in the Integration job.
+- A new performance test restores 20,000 and 400,000 rows under the same 24 MB memory ceiling.
+
+### Upgrade notes for v1.7.0
+
+- **Backups made before v1.6.0** have no recorded `dump_driver`. They are treated as `mysqldump`, which is correct because only MySQL backups could be restored then. Restoring one into a PostgreSQL or SQLite connection fails before the download.
+- **Custom dump drivers** keep working for backup. To restore their output, register a `RestoreDriver` with `RestoreDriverFactory::extend()` under the name your dumper records in `backups.dump_driver`. Without one, restoring those backups fails early with a clear error instead of after the download.
+- **PostgreSQL restores** need `ext-pdo_pgsql`. SQLite restores need `ext-pdo_sqlite`.
 
 ## v1.6.0 (2026-10-11)
 
