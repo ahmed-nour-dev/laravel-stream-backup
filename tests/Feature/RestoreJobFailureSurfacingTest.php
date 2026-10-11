@@ -87,6 +87,7 @@ final class RestoreJobFailureSurfacingTest extends TestCase
         $app['config']->set('stream-backup.default_disk', 'local_test');
         $app['config']->set('stream-backup.compression.driver', 'gzip');
         $app['config']->set('stream-backup.encryption.driver', 'openssl-aes-256-gcm');
+        $app['config']->set('database.connections.restore_target_unused', ['driver' => 'mysql']);
     }
 
     public function test_a_wrong_encryption_key_marks_the_restore_record_failed_not_completed(): void
@@ -112,6 +113,7 @@ final class RestoreJobFailureSurfacingTest extends TestCase
             'path'              => $path,
             'status'            => BackupStatus::Completed,
             'encryption_driver' => 'openssl-aes-256-gcm',
+            'dump_driver'       => 'mysql',
         ]);
 
         $context = new RestoreContext(

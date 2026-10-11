@@ -7,14 +7,16 @@ namespace Ahmednour\StreamBackup\Pipelines;
 use Ahmednour\StreamBackup\Contracts\BackupStream;
 use Ahmednour\StreamBackup\Contracts\CompressionDriver;
 use Ahmednour\StreamBackup\Contracts\DownloadDriver;
+use Ahmednour\StreamBackup\Contracts\DumpParser;
+use Ahmednour\StreamBackup\Contracts\RestoreDriver;
 use Ahmednour\StreamBackup\DTOs\RestoreContext;
 use Ahmednour\StreamBackup\DTOs\RestoreResult;
 use Ahmednour\StreamBackup\Encryption\EncryptionFactory;
 use Ahmednour\StreamBackup\Enums\RestoreStatus;
 use Ahmednour\StreamBackup\Exceptions\PipelineException;
+use Ahmednour\StreamBackup\Exceptions\RestoreFailedException;
 use Ahmednour\StreamBackup\Models\Backup;
-use Ahmednour\StreamBackup\Restore\SqlDumpParser;
-use Ahmednour\StreamBackup\Restore\TableRestorer;
+use Ahmednour\StreamBackup\Restore\RestoreDriverFactory;
 use Ahmednour\StreamBackup\Support\EncryptionKeyResolver;
 use Illuminate\Contracts\Config\Repository as Config;
 use Illuminate\Support\Facades\Log;
@@ -53,7 +55,7 @@ final class RestorePipeline
         private readonly CompressionDriver $compression,
         private readonly EncryptionFactory $encryptionFactory,
         private readonly EncryptionKeyResolver $keyResolver,
-        private readonly TableRestorer $restorer,
+        private readonly RestoreDriverFactory $restoreDrivers,
         private readonly DownloadDriver $downloader,
         private readonly Config $config,
     ) {
@@ -64,6 +66,10 @@ final class RestorePipeline
         Log::debug("[RestorePipeline] run() invoked for backup {$backup->id}.");
         $startTime = microtime(true);
         $readChunk = (int) $this->config->get('stream-backup.read_chunk', 64 * 1024);
+
+        // 0. Resolve the restore driver and check it against the target
+        //    connection before any download or decryption work starts.
+        $restoreDriver = $this->resolveRestoreDriver($context, $backup);
 
         // 1. Verify the backup file exists on the configured storage.
         $this->downloader->assertExists($backup->path ?? '');
@@ -102,7 +108,7 @@ final class RestorePipeline
             if ($onProgress) {
                 $onProgress(RestoreStatus::Parsing);
             }
-            $parser = new SqlDumpParser($context->tables);
+            $parser = $restoreDriver->makeParser($context->tables);
             Log::debug("[RestorePipeline] Piping stream to decompressor and parsing inline...");
             $this->pipeToDecompressor(
                 $decryptedStream,
@@ -130,8 +136,8 @@ final class RestorePipeline
             if ($onProgress) {
                 $onProgress(RestoreStatus::Importing);
             }
-            Log::debug("[RestorePipeline] Handing over to TableRestorer...");
-            $result = $this->restorer->restore(
+            Log::debug("[RestorePipeline] Handing over to the restorer...");
+            $result = $restoreDriver->restorer()->restore(
                 $tableBlocks,
                 $context->connectionName,
                 $startTime,
@@ -145,6 +151,32 @@ final class RestorePipeline
             $this->killProcess($decompProc);
             throw $e instanceof PipelineException ? $e : new PipelineException($e->getMessage(), 0, $e);
         }
+    }
+
+    /**
+     * Pick the restore driver for the backup and verify it matches the
+     * target connection's database engine.
+     *
+     * Backups recorded before `dump_driver` existed (null) were MySQL-only.
+     *
+     * @throws RestoreFailedException
+     */
+    private function resolveRestoreDriver(RestoreContext $context, Backup $backup): RestoreDriver
+    {
+        $dumpDriver = $backup->dump_driver !== null && $backup->dump_driver !== '' ? (string) $backup->dump_driver : 'mysql';
+
+        $driver = $this->restoreDrivers->make($dumpDriver);
+
+        $target = $this->config->get("database.connections.{$context->connectionName}.driver");
+        if (! is_string($target) || ! in_array($target, $driver->connectionDrivers(), true)) {
+            throw new RestoreFailedException(
+                "Backup {$backup->id} is a '{$dumpDriver}' backup but connection '{$context->connectionName}' uses the '"
+                . (is_string($target) ? $target : 'unknown')
+                . "' driver. Cross-engine restore is not supported."
+            );
+        }
+
+        return $driver;
     }
 
     /**
@@ -215,7 +247,7 @@ final class RestorePipeline
         mixed $decompStdout,
         mixed $decompStderr,
         int $readChunk,
-        SqlDumpParser $parser,
+        DumpParser $parser,
     ): void {
         Log::debug("[RestorePipeline] Entering pipeToDecompressor loop.");
 
