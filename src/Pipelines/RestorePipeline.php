@@ -163,7 +163,7 @@ final class RestorePipeline
      */
     private function resolveRestoreDriver(RestoreContext $context, Backup $backup): RestoreDriver
     {
-        $dumpDriver = $backup->dump_driver !== null && $backup->dump_driver !== '' ? (string) $backup->dump_driver : 'mysql';
+        $dumpDriver = $backup->dump_driver !== null && $backup->dump_driver !== '' ? (string) $backup->dump_driver : 'mysqldump';
 
         $driver = $this->restoreDrivers->make($dumpDriver);
 

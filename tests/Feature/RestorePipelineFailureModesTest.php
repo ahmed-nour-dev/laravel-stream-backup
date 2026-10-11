@@ -141,17 +141,23 @@ final class RestorePipelineFailureModesTest extends TestCase
 
     public function test_unsupported_dump_driver_fails_before_the_backup_is_downloaded(): void
     {
-        $e = $this->attemptEarlyFailure('oracle', 'restore_target_unused');
+        $e = $this->attemptEarlyFailure('sqlite3', 'restore_target_unused');
 
         self::assertInstanceOf(RestoreFailedException::class, $e);
-        self::assertStringContainsString("'oracle'", $e->getMessage());
+        self::assertStringContainsString("'sqlite3'", $e->getMessage());
     }
 
     public function test_dump_driver_not_matching_the_target_connection_fails_before_download(): void
     {
         $this->app['config']->set('database.connections.pg_target', ['driver' => 'pgsql']);
 
-        $e = $this->attemptEarlyFailure('mysql', 'pg_target');
+        $e = $this->attemptEarlyFailure('mysqldump', 'pg_target');
+
+        self::assertInstanceOf(RestoreFailedException::class, $e);
+        self::assertStringContainsString('Cross-engine', $e->getMessage());
+
+        // And the other way round: a pg_dump backup into a MySQL connection.
+        $e = $this->attemptEarlyFailure('pg_dump', 'restore_target_unused');
 
         self::assertInstanceOf(RestoreFailedException::class, $e);
         self::assertStringContainsString('Cross-engine', $e->getMessage());
@@ -239,7 +245,7 @@ final class RestorePipelineFailureModesTest extends TestCase
             'disk'              => 'local_test',
             'path'              => $path,
             'encryption_driver' => $encryptionDriver,
-            'dump_driver'       => 'mysql',
+            'dump_driver'       => 'mysqldump',
         ]);
 
         $context = new RestoreContext(

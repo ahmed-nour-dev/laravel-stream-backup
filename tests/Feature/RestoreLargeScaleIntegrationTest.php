@@ -316,7 +316,7 @@ final class RestoreLargeScaleIntegrationTest extends TestCase
             'disk'              => 'local_test',
             'path'              => $path,
             'encryption_driver' => $encrypt ? 'openssl-aes-256-gcm' : 'none',
-            'dump_driver'       => 'mysql',
+            'dump_driver'       => 'mysqldump',
         ]);
 
         $context = new RestoreContext(

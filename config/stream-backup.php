@@ -379,11 +379,14 @@ return [
     |
     | Behaviour controls for the streaming restore executor.
     |
-    | NOTE: Restore currently supports MySQL backups only. The parser
-    |   understands mysqldump output; restoring a PostgreSQL (pg_dump) or
-    |   SQLite (sqlite3 .dump) backup is not supported yet, even though
-    |   backup (dump) supports all three databases. See the README's
-    |   "Roadmap" section for tracking.
+    | NOTE: Restore currently supports MySQL and PostgreSQL backups only
+    |   (mysqldump and plain-format pg_dump output), into a connection of the
+    |   same engine. Restoring a SQLite (sqlite3 .dump) backup is not
+    |   supported yet, even though backup (dump) supports all three
+    |   databases. See the README's "Roadmap" section for tracking. The
+    |   settings below that mention MySQL (strip_definers, skip_on_error,
+    |   atomic_restore) do not apply to PostgreSQL restores, which run in a
+    |   single transaction instead.
     |
     | strip_definers: mysqldump embeds DEFINER=`user`@`host` clauses in every
     |   view, procedure, function, trigger and event. Restoring these under a

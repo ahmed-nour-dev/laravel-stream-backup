@@ -19,7 +19,7 @@ final class MySqlRestoreDriver implements RestoreDriver
 
     public function name(): string
     {
-        return 'mysql';
+        return 'mysqldump';
     }
 
     public function connectionDrivers(): array

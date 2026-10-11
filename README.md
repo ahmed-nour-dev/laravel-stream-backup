@@ -7,11 +7,11 @@
 
 > Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → transaction restores for Laravel 10+, with **constant memory use** regardless of database size.
 
-Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore is currently MySQL-only**; see the [support matrix](#supported-databases) below.
+Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore supports MySQL and PostgreSQL** (SQLite is not yet supported); see the [support matrix](#supported-databases) below.
 
 **Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. No database-sized temporary file is ever created: the pipeline holds at most one multipart part (default 32 MB) in a bounded `php://temp` buffer, which itself spills to disk past 2 MB. So a 300 GB database and a 3 GB database use roughly the same amount of memory, and roughly the same small, bounded amount of scratch disk space — see [Temporary Disk Usage](#temporary-disk-usage) for exact thresholds.
 
-**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction. Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. The parser understands `mysqldump` output only, so restore currently targets **MySQL backups**; restoring a PostgreSQL or SQLite dump is not supported (see [Roadmap](#roadmap)).
+**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction. Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. Restore picks a parser and restorer from the backup's recorded dump tool: `mysqldump` and plain-format `pg_dump` backups are supported, restoring into a connection of the same engine. A backup whose engine has no restore driver, or doesn't match the target connection, is rejected before anything is downloaded. Restoring a SQLite dump is not supported yet (see [Roadmap](#roadmap)).
 
 This package is the productised form of the proof-of-concept script [`backup.php`](./backup.php).
 
@@ -28,7 +28,7 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 | **Local Disk Required** | Yes (>100% of DB size) | **No database-sized staging** (bounded buffers may spill a few MB to disk — see [Temporary Disk Usage](#temporary-disk-usage)) |
 | **Memory Usage** | Variable | **Constant (~32 MB buffer)** |
 | **Encryption** | ❌ No built-in encryption | **AES-256-GCM or XChaCha20-Poly1305** |
-| **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports (MySQL backups only) |
+| **Restore Process** | ❌ No built-in restore | Streams from any driver → Decrypts → Decompresses → Imports (MySQL and PostgreSQL backups) |
 | **Best For** | Small to medium databases | Large databases & multi-tenant setups |
 
 ---
@@ -56,16 +56,16 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 
 ## Supported Databases
 
-**Backup and restore are not the same feature.** Backup (dump) supports MySQL, PostgreSQL, and SQLite. Restore currently only understands `mysqldump` output, so it supports MySQL backups only — restoring a PostgreSQL or SQLite backup is **not currently supported**.
+**Backup and restore are not the same feature.** Backup (dump) supports MySQL, PostgreSQL, and SQLite. Restore understands `mysqldump` and plain-format `pg_dump` (`-F p`) output, so it supports MySQL and PostgreSQL backups — restoring a SQLite backup is **not currently supported**. Cross-engine restore (for example a MySQL backup into PostgreSQL) is not supported.
 
 | Database   | Backup | Restore | Dump Tool    | Credential Handling | Notes |
 |---|---|---|---|---|---|
 | MySQL      | ✅ Yes | ✅ Yes | `mysqldump`  | Temp credential file (`--defaults-extra-file`) | Default; backward compatible |
-| PostgreSQL | ✅ Yes | ❌ Not currently supported | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
+| PostgreSQL | ✅ Yes | ✅ Yes (plain format) | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
 | SQLite     | ✅ Yes | ❌ Not currently supported | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
 | Custom     | Your choice | ❌ Not supported | Your choice  | Your choice | Register via `DumperFactory::extend()` |
 
-PostgreSQL and SQLite restore support is tracked as follow-up work — see [Roadmap](#roadmap).
+SQLite restore support is tracked as follow-up work — see [Roadmap](#roadmap).
 
 ## Supported Destinations
 
@@ -204,7 +204,16 @@ php artisan backup:reconcile               # recover backups stuck between uploa
 
 ### Restore
 
-> ⚠️ **MySQL only.** `backup:restore` parses `mysqldump` output; it does not currently support restoring PostgreSQL or SQLite backups, even though backup (dump) supports all three. See [Roadmap](#roadmap).
+> ⚠️ **MySQL and PostgreSQL only.** `backup:restore` restores `mysqldump` and plain-format `pg_dump` backups into a connection of the same engine. It does not currently support restoring SQLite backups, even though backup (dump) supports all three. See [Roadmap](#roadmap).
+
+#### PostgreSQL restore
+
+- **All or nothing.** The whole restore runs in a single transaction. PostgreSQL DDL is transactional, so any failure rolls back the drops, new tables and loaded data, and the database is left as it was. There are no shadow tables, and `restore.atomic_restore` and `restore.skip_on_error` do not apply (a failed statement aborts a PostgreSQL transaction, so it can't be skipped).
+- **Data loading.** `COPY ... FROM stdin` blocks are streamed through PDO's `copyFromArray()` (`pgsqlCopyFromArray()` before PHP 8.4) in batches of up to 1,000 rows or 4 MB, so memory stays bounded. The alternative, piping to `psql`, would use a second connection that can't join the transaction and would give up the rollback guarantee.
+- **Ordering.** All tables and data are loaded first; constraints, indexes, foreign keys and triggers are added afterwards, as `pg_dump` itself orders them. Cyclic foreign keys work.
+- **Selective restore** (`--tables=`) refuses a foreign key that crosses the restore boundary, exactly as for MySQL. Tables are dropped without `CASCADE`, so a view that depends on a restored table also aborts the restore instead of being silently dropped.
+- **Restored:** tables and their data, owned and identity sequences (with `setval`), defaults, constraints, indexes, triggers, table and column comments, and tables in non-`public` schemas (schemas are created if missing; name them `schema.table` in `--tables`).
+- **Not restored:** functions, types, views, extensions, ownership and privileges (`OWNER TO`, `GRANT`, `REVOKE` are skipped, since the roles may not exist on the target), and sequences not owned by a table. `pg_dump` custom and directory formats (`-F c`, `-F d`) are not supported.
 
 You can restore a backup from S3 or local disk directly as a stream, without downloading the entire file to disk first. SFTP restores currently spool the whole file into a temporary stream before parsing, due to a `phpseclib` limitation — see [Temporary Disk Usage](#temporary-disk-usage).
 
@@ -584,7 +593,7 @@ All of these are resolved from the container and can be swapped:
 
 ## Roadmap
 
-- **PostgreSQL and SQLite restore support** — `SqlDumpParser` currently only understands `mysqldump` output, so `backup:restore` is limited to MySQL backups. Extending the restore pipeline to parse `pg_dump` and `sqlite3 .dump` output is tracked in the project's [issue tracker](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues); backup (dump) already supports all three databases.
+- **SQLite restore support** — `backup:restore` handles MySQL and PostgreSQL backups. Parsing `sqlite3 .dump` output is tracked in the project's [issue tracker](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/40); backup (dump) already supports all three databases.
 
 ## Testing
 
