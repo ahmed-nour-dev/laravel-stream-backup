@@ -11,6 +11,9 @@ use Ahmednour\StreamBackup\Restore\PgSqlDumpParser;
 use Ahmednour\StreamBackup\Restore\PgSqlRestoreDriver;
 use Ahmednour\StreamBackup\Restore\PgSqlRestorer;
 use Ahmednour\StreamBackup\Restore\RestoreDriverFactory;
+use Ahmednour\StreamBackup\Restore\SqliteDumpParser;
+use Ahmednour\StreamBackup\Restore\SqliteRestoreDriver;
+use Ahmednour\StreamBackup\Restore\SqliteRestorer;
 use Ahmednour\StreamBackup\Restore\SqlDumpParser;
 use Ahmednour\StreamBackup\Restore\TableRestorer;
 use Ahmednour\StreamBackup\Tests\TestCase;
@@ -39,14 +42,25 @@ class RestoreDriverFactoryTest extends TestCase
         $this->assertInstanceOf(PgSqlRestorer::class, $driver->restorer());
     }
 
+    public function test_resolves_sqlite3_driver(): void
+    {
+        $driver = $this->app->make(RestoreDriverFactory::class)->make('sqlite3');
+
+        $this->assertInstanceOf(SqliteRestoreDriver::class, $driver);
+        $this->assertSame('sqlite3', $driver->name());
+        $this->assertSame(['sqlite'], $driver->connectionDrivers());
+        $this->assertInstanceOf(SqliteDumpParser::class, $driver->makeParser([]));
+        $this->assertInstanceOf(SqliteRestorer::class, $driver->restorer());
+    }
+
     public function test_unsupported_driver_throws(): void
     {
         $factory = $this->app->make(RestoreDriverFactory::class);
 
-        $this->assertFalse($factory->supports('sqlite3'));
+        $this->assertFalse($factory->supports('oracle'));
 
         $this->expectException(RestoreFailedException::class);
-        $factory->make('sqlite3');
+        $factory->make('oracle');
     }
 
     public function test_extend_registers_a_custom_driver(): void
@@ -54,10 +68,10 @@ class RestoreDriverFactoryTest extends TestCase
         $custom  = $this->createMock(RestoreDriver::class);
         $factory = $this->app->make(RestoreDriverFactory::class);
 
-        $factory->extend('sqlite3', fn () => $custom);
+        $factory->extend('oracle', fn () => $custom);
 
-        $this->assertTrue($factory->supports('sqlite3'));
-        $this->assertSame($custom, $factory->make('sqlite3'));
+        $this->assertTrue($factory->supports('oracle'));
+        $this->assertSame($custom, $factory->make('oracle'));
     }
 
     public function test_factory_is_a_singleton_so_extensions_persist(): void

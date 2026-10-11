@@ -11,9 +11,8 @@ use Ahmednour\StreamBackup\Tests\TestCase;
  * Guards against the documentation drifting back into overstating what the
  * package actually does:
  *
- * - Restore is not supported for every database backup supports. Restore
- *   understands mysqldump and plain-format pg_dump output; SQLite is
- *   backup-only until the restore pipeline is extended.
+ * - Restore supports every database backup supports (MySQL, PostgreSQL
+ *   and SQLite), but only into a connection of the same engine.
  * - The package does not use literally zero local disk. It guarantees no
  *   database-sized temporary files; bounded php://temp buffers may still
  *   spill a small, fixed amount of data to disk (see SqlDumpParser and
@@ -37,9 +36,9 @@ final class DocumentationConsistencyTest extends TestCase
         );
 
         self::assertMatchesRegularExpression(
-            '/\|\s*SQLite\s*\|\s*✅ Yes\s*\|\s*❌ Not currently supported/',
+            '/\|\s*SQLite\s*\|\s*✅ Yes\s*\|\s*✅ Yes/',
             $readme,
-            'README support matrix must mark SQLite restore as not currently supported.'
+            'README support matrix must mark SQLite restore as supported.'
         );
 
         self::assertMatchesRegularExpression(
@@ -49,31 +48,31 @@ final class DocumentationConsistencyTest extends TestCase
         );
     }
 
-    public function test_readme_restore_section_states_the_engine_limitation(): void
+    public function test_readme_restore_section_states_the_same_engine_rule(): void
     {
         $readme = $this->readme();
 
         self::assertStringContainsString(
-            'MySQL and PostgreSQL only',
+            'Same engine only',
             $readme,
-            'The Restore usage section must call out which engines restore supports.'
+            'The Restore usage section must call out that restore needs the same engine.'
         );
     }
 
-    public function test_restore_command_description_states_the_sqlite_limitation(): void
+    public function test_restore_command_description_lists_the_engines(): void
     {
         $command = new RestoreBackupCommand();
 
-        self::assertStringContainsString('PostgreSQL', $command->getDescription());
-        self::assertStringContainsString('SQLite backups are not currently supported', $command->getDescription());
+        self::assertStringContainsString('MySQL, PostgreSQL or SQLite', $command->getDescription());
+        self::assertStringContainsString('same database engine', $command->getDescription());
     }
 
-    public function test_config_restore_section_documents_the_engine_limitation(): void
+    public function test_config_restore_section_documents_the_supported_engines(): void
     {
         $configSource = (string) file_get_contents(dirname(__DIR__, 2) . '/config/stream-backup.php');
 
         self::assertStringContainsString(
-            'Restore currently supports MySQL and PostgreSQL backups only',
+            'Restore supports MySQL (mysqldump), PostgreSQL (plain-format',
             $configSource
         );
     }
