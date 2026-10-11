@@ -141,10 +141,10 @@ final class RestorePipelineFailureModesTest extends TestCase
 
     public function test_unsupported_dump_driver_fails_before_the_backup_is_downloaded(): void
     {
-        $e = $this->attemptEarlyFailure('sqlite3', 'restore_target_unused');
+        $e = $this->attemptEarlyFailure('oracle', 'restore_target_unused');
 
         self::assertInstanceOf(RestoreFailedException::class, $e);
-        self::assertStringContainsString("'sqlite3'", $e->getMessage());
+        self::assertStringContainsString("'oracle'", $e->getMessage());
     }
 
     public function test_dump_driver_not_matching_the_target_connection_fails_before_download(): void

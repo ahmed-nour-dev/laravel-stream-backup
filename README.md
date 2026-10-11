@@ -7,11 +7,11 @@
 
 > Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → transaction restores for Laravel 10+, with **constant memory use** regardless of database size.
 
-Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore supports MySQL and PostgreSQL** (SQLite is not yet supported); see the [support matrix](#supported-databases) below.
+Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore supports all three**; see the [support matrix](#supported-databases) below.
 
 **Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. No database-sized temporary file is ever created: the pipeline holds at most one multipart part (default 32 MB) in a bounded `php://temp` buffer, which itself spills to disk past 2 MB. So a 300 GB database and a 3 GB database use roughly the same amount of memory, and roughly the same small, bounded amount of scratch disk space — see [Temporary Disk Usage](#temporary-disk-usage) for exact thresholds.
 
-**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction. Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. Restore picks a parser and restorer from the backup's recorded dump tool: `mysqldump` and plain-format `pg_dump` backups are supported, restoring into a connection of the same engine. A backup whose engine has no restore driver, or doesn't match the target connection, is rejected before anything is downloaded. Restoring a SQLite dump is not supported yet (see [Roadmap](#roadmap)).
+**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction. Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. Restore picks a parser and restorer from the backup's recorded dump tool: `mysqldump`, plain-format `pg_dump` and `sqlite3 .dump` backups are supported, restoring into a connection of the same engine. A backup whose engine has no restore driver, or doesn't match the target connection, is rejected before anything is downloaded.
 
 This package is the productised form of the proof-of-concept script [`backup.php`](./backup.php).
 
@@ -56,16 +56,14 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 
 ## Supported Databases
 
-**Backup and restore are not the same feature.** Backup (dump) supports MySQL, PostgreSQL, and SQLite. Restore understands `mysqldump` and plain-format `pg_dump` (`-F p`) output, so it supports MySQL and PostgreSQL backups — restoring a SQLite backup is **not currently supported**. Cross-engine restore (for example a MySQL backup into PostgreSQL) is not supported.
+**Backup and restore are not the same feature.** Backup (dump) supports MySQL, PostgreSQL, and SQLite. Restore understands `mysqldump`, plain-format `pg_dump` (`-F p`) and `sqlite3 .dump` output, so all three backup engines can be restored. Cross-engine restore (for example a MySQL backup into PostgreSQL) is not supported.
 
 | Database   | Backup | Restore | Dump Tool    | Credential Handling | Notes |
 |---|---|---|---|---|---|
 | MySQL      | ✅ Yes | ✅ Yes | `mysqldump`  | Temp credential file (`--defaults-extra-file`) | Default; backward compatible |
 | PostgreSQL | ✅ Yes | ✅ Yes (plain format) | `pg_dump`    | `PGPASSWORD` environment variable | Password never on CLI |
-| SQLite     | ✅ Yes | ❌ Not currently supported | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
+| SQLite     | ✅ Yes | ✅ Yes | `sqlite3`    | N/A (file-based, no auth) | Reads path from Laravel config |
 | Custom     | Your choice | ❌ Not supported | Your choice  | Your choice | Register via `DumperFactory::extend()` |
-
-SQLite restore support is tracked as follow-up work — see [Roadmap](#roadmap).
 
 ## Supported Destinations
 
@@ -204,7 +202,15 @@ php artisan backup:reconcile               # recover backups stuck between uploa
 
 ### Restore
 
-> ⚠️ **MySQL and PostgreSQL only.** `backup:restore` restores `mysqldump` and plain-format `pg_dump` backups into a connection of the same engine. It does not currently support restoring SQLite backups, even though backup (dump) supports all three. See [Roadmap](#roadmap).
+> ℹ️ **Same engine only.** `backup:restore` restores `mysqldump`, plain-format `pg_dump` and `sqlite3 .dump` backups into a connection of the same engine. Restoring a backup into a different engine (for example MySQL into PostgreSQL) is rejected before anything is downloaded.
+
+#### SQLite restore
+
+- **All or nothing, in place.** A full or selective restore drops and recreates the dumped tables inside one transaction. SQLite DDL is transactional, so any failure rolls everything back and leaves the database file as it was. Tables that are not in the dump (including this package's own tables when they share the file) are left alone.
+- **No file swap.** Building a new file and renaming it over the target would lose writes made during the restore, leave open connections on the old file, and discard tables that aren't in the dump. The trade-off of the transaction is that SQLite's single write lock is held for the whole restore, so other writers wait (up to their busy timeout).
+- **Foreign keys.** Enforcement is switched off for the restore and put back afterwards. If it was on, the restored data is checked with `PRAGMA foreign_key_check` before commit, and a restore that would break referential integrity rolls back. A foreign key crossing the restore set is refused first, as for the other engines.
+- **Restored:** tables and rows, indexes, triggers, views and `sqlite_sequence` values (so `AUTOINCREMENT` continues where it left off). Select tables or views with `--tables=` (names are matched case-insensitively).
+- **Not restored:** virtual tables. A view is only restored when you restore everything or name it in `--tables=`; a table's own indexes and triggers always come with it.
 
 #### PostgreSQL restore
 
@@ -593,7 +599,7 @@ All of these are resolved from the container and can be swapped:
 
 ## Roadmap
 
-- **SQLite restore support** — `backup:restore` handles MySQL and PostgreSQL backups. Parsing `sqlite3 .dump` output is tracked in the project's [issue tracker](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/40); backup (dump) already supports all three databases.
+Restore now covers every engine that backup does. Not planned for now: cross-engine restore (for example a MySQL backup into PostgreSQL) and `pg_dump` custom or directory formats (`-F c`, `-F d`). Open an issue in the project's [issue tracker](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues) if you need either.
 
 ## Testing
 
@@ -635,7 +641,7 @@ vendor/bin/phpunit --testsuite Integration
 | Driver | Env vars |
 | --- | --- |
 | PostgreSQL (`pg_dump` on PATH) | `STREAM_BACKUP_TEST_PGSQL_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` |
-| SQLite (`sqlite3` on PATH) | none — uses a throwaway temp file |
+| SQLite (`sqlite3` on PATH) | none — uses a throwaway temp file (dump and restore round trip) |
 | S3-compatible / MinIO (`sqlite3` + `gzip` on PATH) | `STREAM_BACKUP_TEST_S3_ENDPOINT` / `_KEY` / `_SECRET` / `_BUCKET` / `_REGION` |
 | SFTP (`sqlite3` + `gzip` on PATH) | `STREAM_BACKUP_TEST_SFTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_ROOT` |
 
