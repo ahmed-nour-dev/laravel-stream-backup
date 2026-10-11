@@ -113,7 +113,7 @@ final class RestoreJobFailureSurfacingTest extends TestCase
             'path'              => $path,
             'status'            => BackupStatus::Completed,
             'encryption_driver' => 'openssl-aes-256-gcm',
-            'dump_driver'       => 'mysql',
+            'dump_driver'       => 'mysqldump',
         ]);
 
         $context = new RestoreContext(

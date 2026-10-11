@@ -16,10 +16,10 @@ class RestoreDriverFactoryTest extends TestCase
 {
     public function test_resolves_mysql_driver(): void
     {
-        $driver = $this->app->make(RestoreDriverFactory::class)->make('mysql');
+        $driver = $this->app->make(RestoreDriverFactory::class)->make('mysqldump');
 
         $this->assertInstanceOf(MySqlRestoreDriver::class, $driver);
-        $this->assertSame('mysql', $driver->name());
+        $this->assertSame('mysqldump', $driver->name());
         $this->assertSame(['mysql', 'mariadb'], $driver->connectionDrivers());
         $this->assertInstanceOf(SqlDumpParser::class, $driver->makeParser([]));
         $this->assertInstanceOf(TableRestorer::class, $driver->restorer());
@@ -29,10 +29,10 @@ class RestoreDriverFactoryTest extends TestCase
     {
         $factory = $this->app->make(RestoreDriverFactory::class);
 
-        $this->assertFalse($factory->supports('pgsql'));
+        $this->assertFalse($factory->supports('sqlite3'));
 
         $this->expectException(RestoreFailedException::class);
-        $factory->make('pgsql');
+        $factory->make('sqlite3');
     }
 
     public function test_extend_registers_a_custom_driver(): void
@@ -40,10 +40,10 @@ class RestoreDriverFactoryTest extends TestCase
         $custom  = $this->createMock(RestoreDriver::class);
         $factory = $this->app->make(RestoreDriverFactory::class);
 
-        $factory->extend('pgsql', fn () => $custom);
+        $factory->extend('sqlite3', fn () => $custom);
 
-        $this->assertTrue($factory->supports('pgsql'));
-        $this->assertSame($custom, $factory->make('pgsql'));
+        $this->assertTrue($factory->supports('sqlite3'));
+        $this->assertSame($custom, $factory->make('sqlite3'));
     }
 
     public function test_factory_is_a_singleton_so_extensions_persist(): void

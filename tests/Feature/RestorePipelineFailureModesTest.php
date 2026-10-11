@@ -151,7 +151,7 @@ final class RestorePipelineFailureModesTest extends TestCase
     {
         $this->app['config']->set('database.connections.pg_target', ['driver' => 'pgsql']);
 
-        $e = $this->attemptEarlyFailure('mysql', 'pg_target');
+        $e = $this->attemptEarlyFailure('mysqldump', 'pg_target');
 
         self::assertInstanceOf(RestoreFailedException::class, $e);
         self::assertStringContainsString('Cross-engine', $e->getMessage());
@@ -239,7 +239,7 @@ final class RestorePipelineFailureModesTest extends TestCase
             'disk'              => 'local_test',
             'path'              => $path,
             'encryption_driver' => $encryptionDriver,
-            'dump_driver'       => 'mysql',
+            'dump_driver'       => 'mysqldump',
         ]);
 
         $context = new RestoreContext(

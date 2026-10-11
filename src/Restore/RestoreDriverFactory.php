@@ -34,7 +34,7 @@ final class RestoreDriverFactory
 
     public function supports(string $dumpDriver): bool
     {
-        return isset($this->customDrivers[$dumpDriver]) || $dumpDriver === 'mysql';
+        return isset($this->customDrivers[$dumpDriver]) || $dumpDriver === 'mysqldump';
     }
 
     /**
@@ -47,7 +47,7 @@ final class RestoreDriverFactory
         }
 
         return match ($dumpDriver) {
-            'mysql' => $this->app->make(MySqlRestoreDriver::class),
+            'mysqldump' => $this->app->make(MySqlRestoreDriver::class),
             default => throw new RestoreFailedException(
                 "Restore is not supported for '{$dumpDriver}' backups."
             ),

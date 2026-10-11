@@ -7,7 +7,7 @@ All notable changes to this project are documented in this file.
 ### Changes
 
 - **Restore is now driver-aware.** A new `RestoreDriver` contract pairs a dump parser with a restorer and is resolved from `backups.dump_driver` by `RestoreDriverFactory`, which has an `extend()` hook like `DumperFactory`. MySQL is the only built-in driver, and its behavior is unchanged. This is groundwork for PostgreSQL and SQLite restore (#40).
-- **Unsupported or mismatched restores fail before the download.** `RestorePipeline::run()` now raises `RestoreFailedException` up front when the backup's `dump_driver` has no restore driver, or doesn't match the target connection's driver. Backups with no recorded `dump_driver` are treated as MySQL.
+- **Unsupported or mismatched restores fail before the download.** `RestorePipeline::run()` now raises `RestoreFailedException` up front when the backup's `dump_driver` has no restore driver, or doesn't match the target connection's driver. Backups with no recorded `dump_driver` are treated as mysqldump (MySQL).
 
 ## v1.6.0 (2026-10-11)
 

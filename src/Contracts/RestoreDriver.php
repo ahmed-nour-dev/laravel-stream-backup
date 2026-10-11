@@ -12,7 +12,7 @@ namespace Ahmednour\StreamBackup\Contracts;
 interface RestoreDriver
 {
     /**
-     * Dump driver name this restore driver handles (e.g. 'mysql').
+     * Dump driver name this restore driver handles (the recorded `backups.dump_driver`, e.g. 'mysqldump').
      */
     public function name(): string;
 
