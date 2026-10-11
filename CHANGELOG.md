@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### New features
+
+- **PostgreSQL restore.** `backup:restore` now restores plain-format `pg_dump` backups into a PostgreSQL connection, including selective `--tables` restores. The whole restore runs in one transaction, so a failure leaves the database as it was. `COPY` data is streamed in bounded batches through PDO's `copyFromArray()`. Constraints, indexes and foreign keys are added after all data is loaded, so cyclic foreign keys work. A selective restore refuses foreign keys that cross the restore boundary, like MySQL. Sequences (including identity columns), non-`public` schemas and table comments are handled. Functions, types, views, extensions, ownership and privileges are not restored. SQLite restore is still to come (#40).
+
 ### Changes
 
 - **Restore is now driver-aware.** A new `RestoreDriver` contract pairs a dump parser with a restorer and is resolved from `backups.dump_driver` by `RestoreDriverFactory`, which has an `extend()` hook like `DumperFactory`. MySQL is the only built-in driver, and its behavior is unchanged. This is groundwork for PostgreSQL and SQLite restore (#40).
