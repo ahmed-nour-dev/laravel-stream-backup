@@ -182,6 +182,10 @@ final class PgSqlDumpParser implements DumpParser
             }
         }
 
+        foreach (array_diff_key($this->sequenceSql, $this->sequenceOwner) as $sequence => $_) {
+            Log::warning("[Restore] Sequence `{$sequence}` has no owning table in the backup and was not restored.");
+        }
+
         $out = [];
         foreach (array_keys($this->tables) as $table) {
             $stream = fopen('php://temp/maxmemory:' . self::TEMP_MAX_MEMORY, 'r+b');
@@ -317,6 +321,25 @@ final class PgSqlDumpParser implements DumpParser
         $type  = $block['type'];
 
         if ($type === 'SEQUENCE') {
+            // pg_dump 16 emits an identity column as its own SEQUENCE block
+            // holding `ALTER TABLE ... ADD GENERATED ... AS IDENTITY (...)`.
+            if (! $block['resolved']) {
+                $id = PgSqlIdentifier::PART;
+                if (preg_match("/^ALTER TABLE (?:ONLY )?({$id})\\.({$id}) ALTER COLUMN .* ADD GENERATED (?:ALWAYS|BY DEFAULT) AS IDENTITY\\b/", $trimmed, $m) === 1) {
+                    $block['table']    = PgSqlIdentifier::tableKey(PgSqlIdentifier::unquote($m[1]), PgSqlIdentifier::unquote($m[2]));
+                    $block['resolved'] = true;
+                }
+            }
+
+            if ($block['resolved']) {
+                if (preg_match('/SEQUENCE NAME (' . PgSqlIdentifier::PART . ')\\.(' . PgSqlIdentifier::PART . ')/', $trimmed, $m) === 1) {
+                    $this->sequenceOwner[PgSqlIdentifier::unquote($m[1]) . '.' . PgSqlIdentifier::unquote($m[2])] = $block['table'];
+                }
+                $this->writeRest($line, $block['table']);
+
+                return;
+            }
+
             $key = $block['schema'] . '.' . $block['name'];
             $this->sequenceSql[$key] = ($this->sequenceSql[$key] ?? '') . $line;
 

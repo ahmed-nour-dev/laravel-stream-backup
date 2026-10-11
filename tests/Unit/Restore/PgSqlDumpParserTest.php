@@ -193,4 +193,61 @@ SQL;
 
         $this->assertStringContainsString("setval('public.sbr_pg_ident_id_seq', 9, true)", $this->parse($dump)['sbr_pg_ident']);
     }
+
+    public function test_pg_dump_16_identity_block_follows_its_table(): void
+    {
+        $dump = <<<'SQL'
+SET client_encoding = 'UTF8';
+
+--
+-- Name: audits; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.audits (
+    id bigint NOT NULL,
+    payload json
+);
+
+--
+-- Name: audits_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.audits ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.audits_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+--
+-- Data for Name: audits; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.audits (id, payload) FROM stdin;
+1	{"a":1}
+\.
+
+--
+-- Name: audits_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.audits_id_seq', 2, true);
+
+SQL;
+
+        foreach ([[], ['audits']] as $tables) {
+            $sql = $this->parse($dump, $tables)['audits'];
+            $create = strpos($sql, 'CREATE TABLE public.audits');
+            $identity = strpos($sql, 'ADD GENERATED ALWAYS AS IDENTITY');
+            $copy = strpos($sql, 'COPY public.audits');
+            $setval = strpos($sql, "setval('public.audits_id_seq', 2, true)");
+
+            $this->assertNotFalse($identity);
+            $this->assertNotFalse($setval);
+            $this->assertTrue($create < $identity && $identity < $copy && $copy < $setval);
+            $this->assertStringContainsString('CACHE 1', $sql);
+        }
+    }
 }

@@ -220,6 +220,7 @@ php artisan backup:reconcile               # recover backups stuck between uploa
 - **Selective restore** (`--tables=`) refuses a foreign key that crosses the restore boundary, exactly as for MySQL. Tables are dropped without `CASCADE`, so a view that depends on a restored table also aborts the restore instead of being silently dropped.
 - **Restored:** tables and their data, owned and identity sequences (with `setval`), defaults, constraints, indexes, triggers, table and column comments, and tables in non-`public` schemas (schemas are created if missing; name them `schema.table` in `--tables`).
 - **Not restored:** functions, types, views, extensions, ownership and privileges (`OWNER TO`, `GRANT`, `REVOKE` are skipped, since the roles may not exist on the target), and sequences not owned by a table. `pg_dump` custom and directory formats (`-F c`, `-F d`) are not supported.
+- **Restore over an existing database.** Types, functions and extensions are not restored, so a table that uses an enum type or a trigger function needs those to exist already. PostgreSQL restore is for restoring over an existing database, not onto a fresh server. A restore that hits a missing type fails and rolls back cleanly.
 
 You can restore a backup from S3 or local disk directly as a stream, without downloading the entire file to disk first. SFTP restores currently spool the whole file into a temporary stream before parsing, due to a `phpseclib` limitation — see [Temporary Disk Usage](#temporary-disk-usage).
 
