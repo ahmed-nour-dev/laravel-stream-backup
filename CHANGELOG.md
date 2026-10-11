@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## v1.6.0 (Unreleased)
+## v1.6.0 (2026-10-11)
 
 This release makes backups and restores more reliable and safer to operate. It adds timeout safeguards, retry-aware backup tracking, crash recovery, and optional end-to-end checksum verification. It also fixes several restore correctness bugs and tightens a few defaults.
 
