@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ahmednour\StreamBackup\Restore;
 
+use Ahmednour\StreamBackup\Contracts\DumpParser;
 use Ahmednour\StreamBackup\Exceptions\InvalidBackupException;
 use Ahmednour\StreamBackup\Exceptions\TableNotFoundException;
 use Illuminate\Support\Facades\Log;
@@ -30,7 +31,7 @@ use LogicException;
  *   -- Dumping data for table `xxx`      ← start of DML block
  *   -- Table structure for table `yyy`   ← end of current table, start of next
  */
-final class SqlDumpParser
+final class SqlDumpParser implements DumpParser
 {
     /**
      * Regex matching the mysqldump "Table structure" comment.

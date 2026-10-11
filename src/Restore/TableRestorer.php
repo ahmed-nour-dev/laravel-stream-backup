@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ahmednour\StreamBackup\Restore;
 
+use Ahmednour\StreamBackup\Contracts\DumpRestorer;
 use Ahmednour\StreamBackup\DTOs\RestoreResult;
 use Ahmednour\StreamBackup\Exceptions\RestoreFailedException;
 use Illuminate\Contracts\Config\Repository as Config;
@@ -118,7 +119,7 @@ use Illuminate\Support\Facades\Log;
  *   6. On any Throwable: rollbackShadows(), then re-throw.
  *   7. finally: re-enable FK checks + close buffers.
  */
-final class TableRestorer
+final class TableRestorer implements DumpRestorer
 {
     private readonly DefinerStripper $definerStripper;
     private readonly StatementFilter $statementFilter;

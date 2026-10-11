@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Changes
+
+- **Restore is now driver-aware.** A new `RestoreDriver` contract pairs a dump parser with a restorer and is resolved from `backups.dump_driver` by `RestoreDriverFactory`, which has an `extend()` hook like `DumperFactory`. MySQL is the only built-in driver, and its behavior is unchanged. This is groundwork for PostgreSQL and SQLite restore (#40).
+- **Unsupported or mismatched restores fail before the download.** `RestorePipeline::run()` now raises `RestoreFailedException` up front when the backup's `dump_driver` has no restore driver, or doesn't match the target connection's driver. Backups with no recorded `dump_driver` are treated as MySQL.
+
 ## v1.6.0 (2026-10-11)
 
 This release makes backups and restores more reliable and safer to operate. It adds timeout safeguards, retry-aware backup tracking, crash recovery, and optional end-to-end checksum verification. It also fixes several restore correctness bugs and tightens a few defaults.

@@ -6,6 +6,7 @@ namespace Ahmednour\StreamBackup\Tests\Feature;
 
 use Ahmednour\StreamBackup\DTOs\RestoreContext;
 use Ahmednour\StreamBackup\Exceptions\PipelineException;
+use Ahmednour\StreamBackup\Exceptions\RestoreFailedException;
 use Ahmednour\StreamBackup\Models\Backup;
 use Ahmednour\StreamBackup\Pipelines\RestorePipeline;
 use Ahmednour\StreamBackup\Tests\Support\BuildsRestoreFixtures;
@@ -75,6 +76,10 @@ final class RestorePipelineFailureModesTest extends TestCase
         $app['config']->set('stream-backup.destination.driver', 'local');
         $app['config']->set('stream-backup.default_disk', 'local_test');
         $app['config']->set('stream-backup.compression.driver', 'gzip');
+
+        // Config-only MySQL target: the driver check reads the driver name
+        // but nothing here ever opens a connection.
+        $app['config']->set('database.connections.restore_target_unused', ['driver' => 'mysql']);
     }
 
     public function test_corrupted_encrypted_backup_fails_the_restore_instead_of_succeeding_partially(): void
@@ -134,6 +139,67 @@ final class RestorePipelineFailureModesTest extends TestCase
         self::assertInstanceOf(PipelineException::class, $result);
     }
 
+    public function test_unsupported_dump_driver_fails_before_the_backup_is_downloaded(): void
+    {
+        $e = $this->attemptEarlyFailure('oracle', 'restore_target_unused');
+
+        self::assertInstanceOf(RestoreFailedException::class, $e);
+        self::assertStringContainsString("'oracle'", $e->getMessage());
+    }
+
+    public function test_dump_driver_not_matching_the_target_connection_fails_before_download(): void
+    {
+        $this->app['config']->set('database.connections.pg_target', ['driver' => 'pgsql']);
+
+        $e = $this->attemptEarlyFailure('mysql', 'pg_target');
+
+        self::assertInstanceOf(RestoreFailedException::class, $e);
+        self::assertStringContainsString('Cross-engine', $e->getMessage());
+    }
+
+    public function test_a_backup_without_a_recorded_dump_driver_is_treated_as_mysql(): void
+    {
+        // A null dump_driver passes the early check (a mysql connection) and
+        // only then fails on the missing file, as a PipelineException-free
+        // download error — i.e. not a RestoreFailedException.
+        $e = $this->attemptEarlyFailure(null, 'restore_target_unused');
+
+        self::assertNotInstanceOf(RestoreFailedException::class, $e);
+    }
+
+    /**
+     * Run the pipeline against a backup whose file does not exist. A
+     * RestoreFailedException therefore proves the check ran before the
+     * download/existence step, which would otherwise fail first.
+     */
+    private function attemptEarlyFailure(?string $dumpDriver, string $connection): \Throwable
+    {
+        $backup = new Backup([
+            'id'                => 1,
+            'database_name'     => 'irrelevant',
+            'disk'              => 'local_test',
+            'path'              => 'does/not/exist.sql.gz',
+            'encryption_driver' => 'none',
+            'dump_driver'       => $dumpDriver,
+        ]);
+
+        $context = new RestoreContext(
+            backupId: 1,
+            tables: [],
+            connectionName: $connection,
+            databaseName: 'irrelevant',
+            disk: 'local_test',
+        );
+
+        try {
+            $this->app->make(RestorePipeline::class)->run($context, $backup);
+        } catch (\Throwable $e) {
+            return $e;
+        }
+
+        self::fail('Expected RestorePipeline::run() to throw.');
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
@@ -173,12 +239,13 @@ final class RestorePipelineFailureModesTest extends TestCase
             'disk'              => 'local_test',
             'path'              => $path,
             'encryption_driver' => $encryptionDriver,
+            'dump_driver'       => 'mysql',
         ]);
 
         $context = new RestoreContext(
             backupId: 1,
             tables: [],
-            connectionName: 'testing',
+            connectionName: 'restore_target_unused',
             databaseName: 'irrelevant',
             disk: 'local_test',
         );

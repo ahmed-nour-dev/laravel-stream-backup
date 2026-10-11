@@ -35,6 +35,7 @@ use Ahmednour\StreamBackup\Pipelines\StreamPipeline;
 use Ahmednour\StreamBackup\Resolvers\ConfigTenantResolver;
 use Ahmednour\StreamBackup\Resolvers\SingleDatabaseResolver;
 use Ahmednour\StreamBackup\Restore\SqlDumpParser;
+use Ahmednour\StreamBackup\Restore\RestoreDriverFactory;
 use Ahmednour\StreamBackup\Restore\TableRestorer;
 use Ahmednour\StreamBackup\Support\BackupPathBuilder;
 use Ahmednour\StreamBackup\Support\BackupReconciler;
@@ -125,6 +126,9 @@ class StreamBackupServiceProvider extends ServiceProvider
         // Third-party packages call DumperFactory::extend() in their
         // ServiceProvider::boot() to register custom drivers (OCP).
         $this->app->singleton(DumperFactory::class);
+
+        // RestoreDriverFactory — singleton so extend() registrations persist.
+        $this->app->singleton(RestoreDriverFactory::class);
 
         // EncryptionFactory — singleton so extend() registrations persist.
         // Third-party packages call EncryptionFactory::extend() in their
