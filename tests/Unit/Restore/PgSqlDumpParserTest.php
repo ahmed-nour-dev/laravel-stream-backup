@@ -63,14 +63,22 @@ class PgSqlDumpParserTest extends TestCase
         $this->assertStringNotContainsString('set_config', $users);
     }
 
-    public function test_foreign_key_belongs_to_the_child_after_the_marker(): void
+    public function test_foreign_key_belongs_to_the_child_after_the_foreign_keys_marker(): void
     {
         $blocks = $this->parse($this->pgDump());
 
         $posts = $blocks['sbr_pg_posts'];
         $this->assertGreaterThan(
-            strpos($posts, PgSqlDumpParser::POST_DATA_MARKER),
+            strpos($posts, PgSqlDumpParser::FOREIGN_KEYS_MARKER),
             strpos($posts, 'sbr_pg_posts_user_fk'),
+        );
+        $this->assertGreaterThan(
+            strpos($posts, PgSqlDumpParser::POST_DATA_MARKER),
+            strpos($posts, PgSqlDumpParser::FOREIGN_KEYS_MARKER),
+        );
+        $this->assertLessThan(
+            strpos($posts, PgSqlDumpParser::FOREIGN_KEYS_MARKER),
+            strpos($posts, 'sbr_pg_posts_pkey'),
         );
         $this->assertStringContainsString('sbr_pg_posts_user_idx', $posts);
         $this->assertStringNotContainsString('sbr_pg_posts_user_fk', $blocks['sbr_pg_users']);

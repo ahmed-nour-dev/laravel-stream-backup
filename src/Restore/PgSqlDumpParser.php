@@ -23,11 +23,13 @@ use LogicException;
  *   owned sequences (CREATE SEQUENCE)
  *   OWNED BY, column defaults, COPY data, sequence setval   (stream order)
  *   -- @@sbr:post-data@@
- *   constraints, indexes, foreign keys, triggers, comments
+ *   primary/unique/check constraints, indexes, triggers, comments
+ *   -- @@sbr:foreign-keys@@
+ *   foreign keys
  *
- * PgSqlRestorer replays every table's part before the marker first, then every
- * table's part after it, so cyclic foreign keys never need dependency
- * ordering.
+ * PgSqlRestorer replays each section for every table before moving on to the
+ * next, so cyclic foreign keys never need dependency ordering and a foreign
+ * key never runs before its parent's key exists.
  *
  * Memory is bounded the same way as SqlDumpParser: each table's data goes to a
  * php://temp stream that spills to disk past TEMP_MAX_MEMORY. Only DDL text
@@ -40,6 +42,8 @@ use LogicException;
 final class PgSqlDumpParser implements DumpParser
 {
     public const POST_DATA_MARKER = '-- @@sbr:post-data@@';
+
+    public const FOREIGN_KEYS_MARKER = '-- @@sbr:foreign-keys@@';
 
     private const TEMP_MAX_MEMORY = 2 * 1024 * 1024;
 
@@ -93,6 +97,9 @@ final class PgSqlDumpParser implements DumpParser
 
     /** @var array<string, resource> table => constraints, indexes, ... */
     private array $post = [];
+
+    /** @var array<string, resource> table => foreign keys */
+    private array $fk = [];
 
     /** @var array<string, string> qualified sequence name => CREATE SEQUENCE text */
     private array $sequenceSql = [];
@@ -189,18 +196,28 @@ final class PgSqlDumpParser implements DumpParser
                 stream_copy_to_stream($this->rest[$table], $stream);
                 fclose($this->rest[$table]);
             }
-            if (isset($this->post[$table])) {
+            // Both markers are always written once any later section exists,
+            // so a stage never has to guess which section it is in.
+            if (isset($this->post[$table]) || isset($this->fk[$table])) {
                 fwrite($stream, "\n" . self::POST_DATA_MARKER . "\n");
-                rewind($this->post[$table]);
-                stream_copy_to_stream($this->post[$table], $stream);
-                fclose($this->post[$table]);
+                if (isset($this->post[$table])) {
+                    rewind($this->post[$table]);
+                    stream_copy_to_stream($this->post[$table], $stream);
+                    fclose($this->post[$table]);
+                }
+                if (isset($this->fk[$table])) {
+                    fwrite($stream, "\n" . self::FOREIGN_KEYS_MARKER . "\n");
+                    rewind($this->fk[$table]);
+                    stream_copy_to_stream($this->fk[$table], $stream);
+                    fclose($this->fk[$table]);
+                }
             }
 
             rewind($stream);
             $out[$table] = $stream;
         }
 
-        $this->rest = $this->post = $this->pre = [];
+        $this->rest = $this->post = $this->fk = $this->pre = [];
 
         return $out;
     }
@@ -393,6 +410,9 @@ final class PgSqlDumpParser implements DumpParser
 
         if (in_array($type, self::DEFAULT_TYPES, true)) {
             $this->writeRest($line, $table);
+        } elseif ($type === 'FK CONSTRAINT') {
+            $this->fk[$table] ??= fopen('php://temp/maxmemory:' . self::TEMP_MAX_MEMORY, 'r+b');
+            fwrite($this->fk[$table], $line);
         } else {
             $this->writePost($line, $table);
         }
@@ -482,13 +502,13 @@ final class PgSqlDumpParser implements DumpParser
 
     private function closeAll(): void
     {
-        foreach ([$this->rest, $this->post] as $streams) {
+        foreach ([$this->rest, $this->post, $this->fk] as $streams) {
             foreach ($streams as $stream) {
                 if (is_resource($stream)) {
                     fclose($stream);
                 }
             }
         }
-        $this->rest = $this->post = [];
+        $this->rest = $this->post = $this->fk = [];
     }
 }

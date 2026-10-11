@@ -21,10 +21,11 @@ use Illuminate\Support\Facades\Log;
  * `restore.atomic_restore` and `restore.skip_on_error` do not apply, because a
  * failed statement aborts a PostgreSQL transaction and cannot be skipped.
  *
- * ORDERING: pass 1 replays every table's pre-data part (CREATE TABLE,
- * sequences, defaults, data); pass 2 then adds constraints, indexes, foreign
- * keys and triggers. Foreign keys therefore never need dependency ordering,
- * and cyclic foreign keys work.
+ * ORDERING: stage 1 replays every table's pre-data part (CREATE TABLE,
+ * sequences, defaults, data); stage 2 adds primary/unique keys, indexes and
+ * triggers; stage 3 adds foreign keys, which need the parents' keys from
+ * stage 2. Each stage finishes for all tables before the next begins, so no
+ * dependency ordering is needed and cyclic foreign keys work.
  *
  * LOADING DATA: COPY ... FROM stdin cannot go through PDO::exec(). Rows are
  * streamed through PDO's copyFromArray() (pgsqlCopyFromArray() before PHP 8.4)
@@ -74,23 +75,33 @@ final class PgSqlRestorer implements DumpRestorer
                     )));
                 }
 
-                /** @var array<string, int> $postOffsets */
-                $postOffsets = [];
+                // Three stages, each across ALL tables before the next starts:
+                // tables + data, then primary/unique keys, indexes and
+                // triggers, then foreign keys (which need the parents' keys).
+                /** @var array<string, int> $resume stream offset where the next stage continues */
+                $resume = [];
 
                 foreach ($tableBlocks as $table => $stream) {
                     $current = $table;
                     rewind($stream);
-                    [$rows, $offset] = $this->replay($db, $stream, true);
+                    [$rows, $offset] = $this->replay($db, $stream);
                     $totalRows += $rows;
                     if ($offset !== null) {
-                        $postOffsets[$table] = $offset;
+                        $resume[$table] = $offset;
                     }
                 }
 
-                foreach ($postOffsets as $table => $offset) {
-                    $current = $table;
-                    fseek($tableBlocks[$table], $offset);
-                    $this->replay($db, $tableBlocks[$table], false);
+                for ($stage = 2; $stage <= 3 && $resume !== []; $stage++) {
+                    foreach ($resume as $table => $offset) {
+                        $current = $table;
+                        fseek($tableBlocks[$table], $offset);
+                        [, $next] = $this->replay($db, $tableBlocks[$table]);
+                        if ($next === null) {
+                            unset($resume[$table]);
+                        } else {
+                            $resume[$table] = $next;
+                        }
+                    }
                 }
 
                 $db->commit();
@@ -128,13 +139,13 @@ final class PgSqlRestorer implements DumpRestorer
     }
 
     /**
-     * Replay one table's stream. With $untilMarker, stop at the post-data
-     * marker and return the stream offset just after it.
+     * Replay one table's stream from its current position up to the next
+     * stage marker (or the end), returning the offset just after the marker.
      *
      * @param  resource $stream
-     * @return array{0: int, 1: ?int} [rows copied, post-data offset]
+     * @return array{0: int, 1: ?int} [rows copied, offset after the marker, null at end of stream]
      */
-    private function replay(Connection $db, $stream, bool $untilMarker): array
+    private function replay(Connection $db, $stream): array
     {
         $reader = new PgSqlStatementReader();
         $rows   = 0;
@@ -143,11 +154,8 @@ final class PgSqlRestorer implements DumpRestorer
             if ($reader->isIdle()) {
                 $text = rtrim($line, "\r\n");
 
-                if ($text === PgSqlDumpParser::POST_DATA_MARKER) {
-                    if ($untilMarker) {
-                        return [$rows, (int) ftell($stream)];
-                    }
-                    continue;
+                if ($text === PgSqlDumpParser::POST_DATA_MARKER || $text === PgSqlDumpParser::FOREIGN_KEYS_MARKER) {
+                    return [$rows, (int) ftell($stream)];
                 }
 
                 if (preg_match('/^COPY (.+?) \((.*)\) FROM stdin;$/', $text, $m) === 1) {
@@ -202,9 +210,13 @@ final class PgSqlRestorer implements DumpRestorer
                 return;
             }
 
+            // Separator and NULL marker are left at their defaults (tab and \N,
+            // which is what COPY text format in pg_dump output uses): the
+            // extension interpolates an explicit NULL marker into an E'' literal
+            // without escaping it, so passing `\N` would load the text `N`.
             $ok = method_exists($pdo, 'copyFromArray')
-                ? $pdo->copyFromArray($table, $batch, "\t", '\\N', $columns)
-                : $pdo->pgsqlCopyFromArray($table, $batch, "\t", '\\N', $columns);
+                ? $pdo->copyFromArray($table, $batch, fields: $columns)
+                : $pdo->pgsqlCopyFromArray($table, $batch, fields: $columns);
 
             if ($ok === false) {
                 throw new RestoreFailedException("COPY into {$table} failed: " . implode(' ', (array) $pdo->errorInfo()));
