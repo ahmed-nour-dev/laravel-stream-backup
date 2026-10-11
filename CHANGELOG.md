@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.7.1 (2026-10-11)
+
+This is a bug-fix release for PostgreSQL restore. There are no new migrations and no changed defaults.
+
+### Fixes
+
+- **PostgreSQL restore no longer drops identity columns.** `pg_dump` 16 writes `GENERATED ... AS IDENTITY` as a separate `Type: SEQUENCE` block (`ALTER TABLE ... ADD GENERATED ... AS IDENTITY`), not inside `CREATE TABLE`. The parser kept that block as an unowned sequence, so the identity clause and its `setval` were silently skipped and the column came back as plain `NOT NULL`. The block is now attached to its table and replayed after `CREATE TABLE` and before the data load, for full and `--tables` restores. The inline form is still handled.
+- A sequence in the dump that no restored table owns now logs a warning instead of being skipped silently.
+
 ## v1.7.0 (2026-10-11)
 
 This release adds restore support for PostgreSQL and SQLite. `backup:restore` now handles every database that backup supports, restoring into a connection of the same engine. Restore is also driver-aware, so a backup that can't be restored fails before anything is downloaded.

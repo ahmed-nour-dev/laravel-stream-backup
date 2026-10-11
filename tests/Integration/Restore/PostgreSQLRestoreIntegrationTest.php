@@ -25,7 +25,7 @@ final class PostgreSQLRestoreIntegrationTest extends TestCase
     use BuildsIntegrationBackups;
     use BuildsPgDumpFixtures;
 
-    private const TABLES = ['sbr_pg_posts', 'sbr_pg_users', 'sbr_pg_other'];
+    private const TABLES = ['sbr_pg_posts', 'sbr_pg_users', 'sbr_pg_other', 'sbr_pg_ident'];
 
     protected function setUp(): void
     {
@@ -194,6 +194,55 @@ final class PostgreSQLRestoreIntegrationTest extends TestCase
 
         self::assertSame($before, $this->db()->table('sbr_pg_users')->orderBy('id')->get()->map(fn ($r) => (array) $r)->all());
         self::assertSame(2, $this->db()->table('sbr_pg_posts')->count());
+    }
+
+    public function test_real_pg_dump_round_trips_identity_columns_and_schema(): void
+    {
+        if (! $this->binaryAvailable('pg_dump')) {
+            self::markTestSkipped('pg_dump is not available on PATH.');
+        }
+
+        $this->db()->statement('CREATE TABLE sbr_pg_ident (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, payload json)');
+        $this->db()->statement("INSERT INTO sbr_pg_ident (payload) VALUES ('{\"a\":1}'), ('{\"b\":2}')");
+
+        $context = new BackupContext(
+            tenantId:       null,
+            databaseName:   (string) env('STREAM_BACKUP_TEST_PGSQL_DATABASE'),
+            connectionName: 'pgsql_test',
+            disk:           'unused',
+            driver:         'pgsql',
+        );
+        $dumpTable = function () use ($context): string {
+            $stream = $this->app->make(DumperFactory::class)->make('pgsql')->dump($context);
+            $dump   = $this->drain($stream);
+            $stream->close();
+
+            return $dump;
+        };
+
+        $dump   = $dumpTable();
+        $schema = fn (string $sql): string => $this->identitySchema($sql);
+
+        $this->db()->statement('DROP TABLE sbr_pg_ident');
+        $this->restore($dump, ['sbr_pg_ident'], true);
+
+        $this->db()->insert("INSERT INTO sbr_pg_ident (payload) VALUES ('{}')");
+        self::assertSame([1, 2, 3], $this->db()->table('sbr_pg_ident')->orderBy('id')->pluck('id')->map(fn ($i) => (int) $i)->all());
+
+        // The restored table must dump to the same definition as the original.
+        $this->db()->statement('DELETE FROM sbr_pg_ident WHERE id = 3');
+        $this->db()->statement('SELECT setval(pg_get_serial_sequence(\'sbr_pg_ident\', \'id\'), 2, true)');
+        self::assertSame($schema($dump), $schema($dumpTable()));
+    }
+
+    /**
+     * The structural part of a dump for sbr_pg_ident: CREATE TABLE, identity and key statements.
+     */
+    private function identitySchema(string $dump): string
+    {
+        preg_match_all('/^(?:CREATE TABLE public\.sbr_pg_ident .*?\);|ALTER TABLE (?:ONLY )?public\.sbr_pg_ident .*?;)$/ms', $dump, $m);
+
+        return implode("\n", $m[0]);
     }
 
     private function cleanUp(): void
