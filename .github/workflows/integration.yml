@@ -66,18 +66,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gzip sqlite3 postgresql-client
 
-      # MinIO needs a `server /data` command, which the `services:` block
-      # above has no way to supply (it can only set image/env/ports) — so it
-      # runs as a plain background container instead of a GitHub Actions
-      # service. The test bucket isn't pre-created here; S3CompatibleIntegrationTest
-      # creates it itself on first use, so this works against any bare MinIO.
+      # MinIO runs as a plain background container instead of a GitHub Actions
+      # service so it can be started before the Wait step below. The test
+      # bucket isn't pre-created here; S3CompatibleIntegrationTest creates it
+      # itself on first use, so this works against any bare MinIO.
+      #
+      # MinIO no longer publishes pullable community images (quay.io/minio/minio
+      # now rejects pulls as unauthorized, and minio/minio is gone from Docker
+      # Hub), so this uses Bitnami's frozen legacy build pinned to an exact tag.
+      # Its entrypoint already starts the server, so no `server /data` command.
       - name: Start MinIO
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin123 \
-            quay.io/minio/minio:latest server /data
+            bitnamilegacy/minio:2025.7.23-debian-12-r5
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
