@@ -527,6 +527,9 @@ final class TableRestorer implements DumpRestorer
         $renamed = [];
 
         foreach ($definitions as $originalName => $definition) {
+            // PHP turns numeric-string array keys (MariaDB auto-names FKs "1", "2")
+            // into ints; restore the string type the constraint name really is.
+            $originalName = (string) $originalName;
             $tempName = self::temporaryForeignKeyName($shadowTable, $originalName);
 
             $this->execSql($db, "ALTER TABLE `{$shadowTable}` DROP FOREIGN KEY `{$originalName}`");

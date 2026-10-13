@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.7.2 (2026-10-13)
+
+This is a bug-fix release for atomic restore on MySQL and MariaDB. There are no new migrations and no changed defaults.
+
+### Fixes
+
+- **Atomic restore no longer fails on foreign keys with numeric names.** MariaDB auto-names unnamed foreign keys `1`, `2` and so on. PHP turned those names into integer array keys, so `detachOutboundForeignKeys()` passed an `int` to `temporaryForeignKeyName()` and threw a `TypeError` under strict types, rolling back every shadow table. The name is now cast back to a string. ([#47](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/47))
+
 ## v1.7.1 (2026-10-11)
 
 This is a bug-fix release for PostgreSQL restore. There are no new migrations and no changed defaults.
