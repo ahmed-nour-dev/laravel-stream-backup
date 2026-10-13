@@ -412,4 +412,36 @@ final class TableRestorerShadowTest extends TestCase
         self::assertStringContainsString('`orders`', $message);
         self::assertStringContainsString('crossing the restore boundary', $message);
     }
+
+    public function test_detach_handles_numeric_constraint_names(): void
+    {
+        // MariaDB auto-names unnamed FKs "1", "2"; PHP casts those array keys to int.
+        $db = $this->createMock(\Illuminate\Database\ConnectionInterface::class);
+        $db->method('select')->willReturn([
+            (object) [
+                'constraint_name'   => '1',
+                'column_name'       => 'lead_id',
+                'referenced_table'  => 'leads',
+                'referenced_column' => 'id',
+                'update_rule'       => 'RESTRICT',
+                'delete_rule'       => 'CASCADE',
+            ],
+        ]);
+
+        $statements = [];
+        $db->method('unprepared')->willReturnCallback(function (string $sql) use (&$statements): bool {
+            $statements[] = $sql;
+
+            return true;
+        });
+
+        $restorer = new TableRestorer($this->app->make(Config::class));
+        $ref      = new \ReflectionMethod(TableRestorer::class, 'detachOutboundForeignKeys');
+        $ref->setAccessible(true);
+
+        $renamed = $ref->invoke($restorer, $db, '_sbr_lead_sample_requests');
+
+        self::assertSame('1', $renamed[0]['originalName']);
+        self::assertStringContainsString('DROP FOREIGN KEY `1`', $statements[0]);
+    }
 }
