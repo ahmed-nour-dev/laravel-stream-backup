@@ -166,9 +166,25 @@ final class BackupVerifierTest extends TestCase
         $this->assertTrue(true); // Verification passed
     }
 
-    public function test_openssl_throws_with_incorrect_version_byte(): void
+    public function test_openssl_passes_with_wire_format_v2_version_byte(): void
     {
         $this->createS3Mock(1000, "\x02\xff");
+        $verifier = $this->createVerifier();
+
+        $backup = new Backup([
+            'path' => 'test.sql.gz.enc',
+            'disk' => 's3',
+            'size' => 1000,
+            'encryption_driver' => 'openssl-aes-256-gcm',
+        ]);
+
+        $verifier->verify($backup);
+        $this->assertTrue(true); // Verification passed
+    }
+
+    public function test_openssl_throws_with_incorrect_version_byte(): void
+    {
+        $this->createS3Mock(1000, "\x03\xff");
         $verifier = $this->createVerifier();
 
         $backup = new Backup([

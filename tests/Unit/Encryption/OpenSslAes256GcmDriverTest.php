@@ -42,9 +42,10 @@ function opensslDecrypt(string $ciphertext, string $key): string
 
     // Header
     $version   = ord($ciphertext[$pos++]);
-    assert($version === 0x01, "Expected version 0x01, got {$version}");
+    assert($version === 0x02, "Expected version 0x02, got {$version}");
     $baseNonce = substr($ciphertext, $pos, 12);
     $pos      += 12;
+    $header    = substr($ciphertext, 0, 13);
 
     $plaintext  = '';
     $chunkIndex = 0;
@@ -52,10 +53,6 @@ function opensslDecrypt(string $ciphertext, string $key): string
     while ($pos < strlen($ciphertext)) {
         $chunkLen = unpack('N', substr($ciphertext, $pos, 4))[1];
         $pos     += 4;
-
-        if ($chunkLen === 0) {
-            break; // EOF marker
-        }
 
         $tag        = substr($ciphertext, $pos, 16);
         $pos       += 16;
@@ -66,8 +63,14 @@ function opensslDecrypt(string $ciphertext, string $key): string
         $suffix    = substr($baseNonce, 8) ^ pack('N', $chunkIndex++);
         $nonce     = substr($baseNonce, 0, 8) . $suffix;
 
-        $plain = openssl_decrypt($chunk, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $nonce, $tag);
+        // AAD = header . final flag; the final frame has length 0.
+        $final = $chunkLen === 0;
+        $plain = openssl_decrypt($chunk, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $nonce, $tag, $header . ($final ? "\x01" : "\x00"));
         assert($plain !== false, 'openssl_decrypt returned false — authentication tag mismatch?');
+
+        if ($final) {
+            break;
+        }
 
         $plaintext .= $plain;
     }
@@ -143,7 +146,7 @@ final class OpenSslAes256GcmDriverTest extends TestCase
         self::assertSame(implode('', $chunks), opensslDecrypt($encrypted, $key));
     }
 
-    public function test_file_header_version_byte_is_0x01(): void
+    public function test_file_header_version_byte_is_0x02(): void
     {
         $key    = $this->validKey();
         $stream = (new OpenSslAes256GcmDriver())->spawn(new FixedChunkStream(['x']), $key);
@@ -151,7 +154,7 @@ final class OpenSslAes256GcmDriverTest extends TestCase
         $output = $this->drainStream($stream);
         $stream->close();
 
-        self::assertSame(0x01, ord($output[0]));
+        self::assertSame(0x02, ord($output[0]));
     }
 
     public function test_two_encryptions_of_same_plaintext_produce_different_ciphertexts(): void
@@ -188,11 +191,12 @@ final class OpenSslAes256GcmDriverTest extends TestCase
         $suffix    = substr($baseNonce, 8) ^ pack('N', 0);
         $nonce     = substr($baseNonce, 0, 8) . $suffix;
 
-        $result = openssl_decrypt($chunk, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $nonce, $tag);
+        $aad    = substr($tampered, 0, 13) . "\x00";
+        $result = openssl_decrypt($chunk, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $nonce, $tag, $aad);
         self::assertFalse($result, 'Tampered ciphertext must fail GCM authentication.');
     }
 
-    public function test_empty_stream_produces_only_header_and_eof(): void
+    public function test_empty_stream_produces_only_header_and_final_frame(): void
     {
         $key    = $this->validKey();
         $stream = (new OpenSslAes256GcmDriver())->spawn(new FixedChunkStream([]), $key);
@@ -200,9 +204,9 @@ final class OpenSslAes256GcmDriverTest extends TestCase
         $output = $this->drainStream($stream);
         $stream->close();
 
-        // 1 version + 12 nonce + 4 EOF = 17 bytes
-        self::assertSame(17, strlen($output));
-        self::assertSame(0x01, ord($output[0]));
+        // 1 version + 12 nonce + 4 zero length + 16 tag = 33 bytes
+        self::assertSame(33, strlen($output));
+        self::assertSame(0x02, ord($output[0]));
         self::assertSame(0, unpack('N', substr($output, 13, 4))[1]);
     }
 

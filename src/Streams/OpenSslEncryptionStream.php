@@ -14,38 +14,42 @@ use Ahmednour\StreamBackup\Contracts\BackupStream;
  * Memory per iteration: one plaintext chunk + one same-size ciphertext;
  * both are freed at the end of each read() call.
  *
- * Wire format:
- *   [1 byte:  version = 0x01]
+ * Wire format (v2):
+ *   [1 byte:  version = 0x02]
  *   [12 bytes: random base nonce]
  *   // for each plaintext chunk:
  *   [4 bytes BE: ciphertext length]
  *   [16 bytes: GCM authentication tag]
  *   [N bytes: ciphertext  (N == plaintext length)]
- *   // EOF marker:
+ *   // final frame (authenticated end of stream):
  *   [4 bytes: 0x00000000]
+ *   [16 bytes: GCM authentication tag over empty plaintext]
+ *
+ * AAD of every frame: version byte . base nonce . final flag, where the
+ * final flag is 0x00 for data frames and 0x01 for the final frame. This
+ * binds the header into every chunk and makes the end of the stream
+ * authenticated: a truncated backup cannot be closed with a forged marker.
+ * Nothing may follow the final frame.
  *
  * Per-chunk nonce derivation:
  *   nonce_i = base_nonce with last 4 bytes XOR'd with pack('N', i).
  *   This gives 2^32 unique nonces per backup key — enough for ~256 TB
  *   at 64 KB chunks before nonce reuse (at which point a new key is needed).
+ *   The final frame uses the next index after the last data frame.
  *
- * Decryption pseudocode (for a future restore command):
- *   read 1 byte  → assert version == 0x01
- *   read 12 bytes → base_nonce
- *   loop:
- *     read 4 bytes → ciphertext_len (0 = EOF)
- *     read 16 bytes → tag
- *     read ciphertext_len bytes → ciphertext
- *     nonce_i = base_nonce XOR pack('N', i) (last 4 bytes)
- *     plaintext = openssl_decrypt(ciphertext, 'aes-256-gcm', key,
- *                                 OPENSSL_RAW_DATA, nonce_i, tag)
+ * Wire format v1 (version byte 0x01, written before v2) had no AAD and
+ * ended with a bare 4-byte 0x00000000 marker; OpenSslDecryptionStream
+ * still reads it.
  */
 final class OpenSslEncryptionStream implements BackupStream
 {
     private const ALGORITHM = 'aes-256-gcm';
-    private const VERSION   = "\x01";
+    private const VERSION   = "\x02";
     private const NONCE_LEN = 12;
     private const TAG_LEN   = 16;
+
+    private const FLAG_DATA  = "\x00";
+    private const FLAG_FINAL = "\x01";
 
     private string $baseNonce;
     private int    $chunkIndex = 0;
@@ -83,7 +87,7 @@ final class OpenSslEncryptionStream implements BackupStream
             return $out;
         }
 
-        // (B) Inner is exhausted; we already emitted the EOF terminator last
+        // (B) Inner is exhausted; we already emitted the final frame last
         //     call — now signal EOF to the pipeline loop.
         if ($this->innerDone) {
             $this->eof = true;
@@ -97,29 +101,14 @@ final class OpenSslEncryptionStream implements BackupStream
             return '';
         }
 
-        // Inner stream exhausted — emit the 4-byte EOF terminator.
+        // Inner stream exhausted — emit the authenticated final frame.
         if ($plain === null) {
             $this->innerDone = true;
-            return pack('N', 0);
+            [$ciphertext, $tag] = $this->encryptFrame('', self::FLAG_FINAL);
+            return pack('N', 0) . $tag;
         }
 
-        // Encrypt the chunk with a unique per-chunk nonce.
-        $nonce      = $this->deriveNonce($this->chunkIndex++);
-        $tag        = '';
-        $ciphertext = openssl_encrypt(
-            $plain,
-            self::ALGORITHM,
-            $this->key,
-            OPENSSL_RAW_DATA,
-            $nonce,
-            $tag,
-        );
-
-        if ($ciphertext === false) {
-            throw new \RuntimeException(
-                'AES-256-GCM encryption failed: ' . openssl_error_string()
-            );
-        }
+        [$ciphertext, $tag] = $this->encryptFrame($plain, self::FLAG_DATA);
 
         // Frame: [4-byte BE len][16-byte tag][ciphertext]
         return pack('N', strlen($ciphertext)) . $tag . $ciphertext;
@@ -145,6 +134,36 @@ final class OpenSslEncryptionStream implements BackupStream
         }
 
         $this->inner->close();
+    }
+
+    /**
+     * Encrypt one frame with a unique per-chunk nonce and the header +
+     * final flag as AAD.
+     *
+     * @return array{0: string, 1: string} [ciphertext, tag]
+     */
+    private function encryptFrame(string $plain, string $flag): array
+    {
+        $nonce      = $this->deriveNonce($this->chunkIndex++);
+        $tag        = '';
+        $ciphertext = openssl_encrypt(
+            $plain,
+            self::ALGORITHM,
+            $this->key,
+            OPENSSL_RAW_DATA,
+            $nonce,
+            $tag,
+            self::VERSION . $this->baseNonce . $flag,
+            self::TAG_LEN,
+        );
+
+        if ($ciphertext === false) {
+            throw new \RuntimeException(
+                'AES-256-GCM encryption failed: ' . openssl_error_string()
+            );
+        }
+
+        return [$ciphertext, $tag];
     }
 
     /**
