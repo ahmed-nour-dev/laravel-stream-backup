@@ -50,10 +50,10 @@ final class FixedChunkStream implements BackupStream
  * "success" — while an unmodified stream still round-trips correctly.
  *
  * Wire format under test (see OpenSslEncryptionStream):
- *   [1 byte  version = 0x01]
+ *   [1 byte  version = 0x02]
  *   [12 bytes base nonce]
  *   repeated: [4 bytes BE ciphertext length][16 bytes GCM tag][ciphertext]
- *   EOF marker: [4 bytes 0x00000000]
+ *   final frame: [4 bytes 0x00000000][16 bytes GCM tag]
  */
 final class OpenSslDecryptionStreamCorruptionTest extends TestCase
 {
@@ -180,7 +180,7 @@ final class OpenSslDecryptionStreamCorruptionTest extends TestCase
         $key  = $this->validKey();
         $blob = $this->encrypt(['payload'], $key);
 
-        $blob[0] = "\x02";
+        $blob[0] = "\x03";
 
         $this->expectException(InvalidBackupException::class);
         $this->expectExceptionMessageMatches('/version byte/');
@@ -249,20 +249,20 @@ final class OpenSslDecryptionStreamCorruptionTest extends TestCase
         $this->decrypt($truncated, $key);
     }
 
-    // ---- Corruption: truncated final stream / missing EOF marker ----
+    // ---- Corruption: truncated final stream / missing final frame ----
 
     public function test_stream_truncated_right_after_last_data_frame_is_rejected(): void
     {
         $key  = $this->validKey();
-        $blob = $this->encrypt(['only chunk, no eof marker follows'], $key);
+        $blob = $this->encrypt(['only chunk, no final frame follows'], $key);
 
-        // Drop exactly the trailing 4-byte 0x00000000 EOF marker so the
-        // stream ends immediately after an otherwise-complete data frame.
-        $withoutEofMarker = substr($blob, 0, -4);
+        // Drop exactly the trailing 20-byte final frame so the stream ends
+        // immediately after an otherwise-complete data frame.
+        $withoutFinalFrame = substr($blob, 0, -20);
 
         $this->expectException(InvalidBackupException::class);
         $this->expectExceptionMessageMatches('/ended unexpectedly/');
-        $this->decrypt($withoutEofMarker, $key);
+        $this->decrypt($withoutFinalFrame, $key);
     }
 
     public function test_stream_truncated_right_after_first_data_frame_does_not_silently_return_partial_plaintext(): void
@@ -272,10 +272,10 @@ final class OpenSslDecryptionStreamCorruptionTest extends TestCase
         $blob   = $this->encrypt($chunks, $key);
 
         $frames = $this->splitFrames($blob);
-        self::assertGreaterThanOrEqual(2, count($frames), 'Expected at least one data frame plus the EOF marker frame.');
+        self::assertGreaterThanOrEqual(2, count($frames), 'Expected at least one data frame plus the final frame.');
 
         // Truncate right after the first complete data frame, dropping the
-        // second data frame and the EOF marker entirely.
+        // second data frame and the final frame entirely.
         $truncated = substr($blob, 0, 1 + 12) . $frames[0];
         $stream    = (new OpenSslAes256GcmDriver())->spawnDecrypt(new FixedChunkStream([$truncated]), $key);
 
@@ -320,7 +320,7 @@ final class OpenSslDecryptionStreamCorruptionTest extends TestCase
         $blob = $this->encrypt(['AAAA first chunk', 'BBBB second chunk'], $key);
 
         $frames = $this->splitFrames($blob);
-        self::assertCount(3, $frames, 'Expected 2 data frames + 1 EOF marker frame.');
+        self::assertCount(3, $frames, 'Expected 2 data frames + 1 final frame.');
 
         // Swap the two data frames (their internal ciphertext lengths
         // happen to differ, but the format allows arbitrary per-frame
@@ -337,7 +337,7 @@ final class OpenSslDecryptionStreamCorruptionTest extends TestCase
     /**
      * Splits the frame region of a wire-format blob (after the 13-byte
      * header) into individual [len][tag][ciphertext] frames, including the
-     * trailing 4-byte EOF marker as its own "frame".
+     * trailing [0x00000000][tag] final frame.
      *
      * @return array<int, string>
      */
@@ -347,18 +347,10 @@ final class OpenSslDecryptionStreamCorruptionTest extends TestCase
         $frames = [];
 
         while ($pos < strlen($blob)) {
-            $len   = unpack('N', substr($blob, $pos, 4))[1];
-            $start = $pos;
-            $pos  += 4;
-
-            if ($len === 0) {
-                $frames[] = substr($blob, $start, 4);
-                break;
-            }
-
+            $len      = unpack('N', substr($blob, $pos, 4))[1];
             $frameLen = 4 + 16 + $len;
-            $frames[] = substr($blob, $start, $frameLen);
-            $pos      = $start + $frameLen;
+            $frames[] = substr($blob, $pos, $frameLen);
+            $pos     += $frameLen;
         }
 
         return $frames;

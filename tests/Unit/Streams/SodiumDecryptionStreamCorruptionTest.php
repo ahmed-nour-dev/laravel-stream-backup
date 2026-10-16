@@ -337,6 +337,90 @@ final class SodiumDecryptionStreamCorruptionTest extends TestCase
         $this->decrypt($reordered, $key);
     }
 
+    // ---- Truncation at a chunk boundary with a forged end marker ----
+
+    public function test_truncation_at_chunk_boundary_with_a_zero_length_frame_is_rejected(): void
+    {
+        // Cut after a complete message frame and append a 0x00000000 length:
+        // only an authenticated TAG_FINAL frame may end the stream.
+        $key    = $this->validKey();
+        $blob   = $this->encrypt(['chunk one', 'chunk two', 'chunk three'], $key);
+        $frames = $this->splitFrames($blob);
+
+        $truncated = substr($blob, 0, $this->headerLen()) . $frames[0] . pack('N', 0);
+
+        $this->expectException(InvalidBackupException::class);
+        $this->decrypt($truncated, $key);
+    }
+
+    public function test_zero_length_frame_before_the_final_frame_is_rejected(): void
+    {
+        $key    = $this->validKey();
+        $blob   = $this->encrypt(['chunk one', 'chunk two'], $key);
+        $frames = $this->splitFrames($blob);
+
+        $tampered = substr($blob, 0, $this->headerLen()) . $frames[0] . pack('N', 0) . $frames[1] . $frames[2];
+
+        $this->expectException(InvalidBackupException::class);
+        $this->decrypt($tampered, $key);
+    }
+
+    // ---- Trailing bytes after the TAG_FINAL frame ----
+
+    public function test_single_trailing_byte_after_final_frame_is_rejected(): void
+    {
+        $key  = $this->validKey();
+        $blob = $this->encrypt(['payload'], $key);
+
+        $this->expectException(InvalidBackupException::class);
+        $this->expectExceptionMessageMatches('/trailing/');
+        $this->decrypt($blob . "\x00", $key);
+    }
+
+    public function test_appended_frame_after_final_frame_is_rejected(): void
+    {
+        $key    = $this->validKey();
+        $blob   = $this->encrypt(['payload', 'more'], $key);
+        $frames = $this->splitFrames($blob);
+
+        $this->expectException(InvalidBackupException::class);
+        $this->expectExceptionMessageMatches('/trailing/');
+        $this->decrypt($blob . $frames[0], $key);
+    }
+
+    public function test_trailing_bytes_arriving_after_non_blocking_empty_reads_are_rejected(): void
+    {
+        $key  = $this->validKey();
+        $blob = $this->encrypt(['payload'], $key);
+
+        $stream = (new SodiumDriver())->spawnDecrypt(new SodiumFixedChunkStream([$blob, '', 'junk']), $key);
+
+        $this->expectException(InvalidBackupException::class);
+        $this->expectExceptionMessageMatches('/trailing/');
+        $this->drain($stream);
+    }
+
+    public function test_decrypt_tolerates_non_blocking_empty_reads_until_inner_eof(): void
+    {
+        $key  = $this->validKey();
+        $blob = $this->encrypt(['abc', 'def'], $key);
+
+        $stream = (new SodiumDriver())->spawnDecrypt(new SodiumFixedChunkStream([$blob, '', '']), $key);
+
+        self::assertSame('abcdef', $this->drain($stream));
+    }
+
+    public function test_decrypt_survives_a_non_blocking_empty_read_between_length_and_frame_body(): void
+    {
+        $key  = $this->validKey();
+        $blob = $this->encrypt(['hello world'], $key);
+
+        $cut    = $this->headerLen() + 4;
+        $stream = (new SodiumDriver())->spawnDecrypt(new SodiumFixedChunkStream([substr($blob, 0, $cut), '', substr($blob, $cut)]), $key);
+
+        self::assertSame('hello world', $this->drain($stream));
+    }
+
     /**
      * Splits the frame region of a wire-format blob (after the header)
      * into individual [len][ciphertext] frames.
