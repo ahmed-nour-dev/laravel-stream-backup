@@ -160,7 +160,7 @@ class RunRestoreJob implements ShouldQueue
             $status = $this->receivedSigterm ? RestoreStatus::Aborted : RestoreStatus::Failed;
 
             // Only mark as aborted if it's not already a RestoreFailedException
-            // (which means SQL failed, so the transaction was rolled back and it's a true failure).
+            // (which means SQL failed, so the restore was rolled back and it's a true failure).
             if ($e instanceof RestoreFailedException) {
                 $status = RestoreStatus::Failed;
             }

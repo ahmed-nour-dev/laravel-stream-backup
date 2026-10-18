@@ -5,13 +5,13 @@
 [![License](https://img.shields.io/packagist/l/ahmednour/laravel-stream-backup.svg?style=flat-square)](https://github.com/ahmed-nour-dev/laravel-stream-backup/blob/main/LICENSE.md)
 [![GitHub Tests Action Status](https://img.shields.io/github/actions/workflow/status/ahmed-nour-dev/laravel-stream-backup/tests.yml?branch=main&label=tests&style=flat-square)](https://github.com/ahmed-nour-dev/laravel-stream-backup/actions?query=workflow%3Atests+branch%3Amain)
 
-> Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → transaction restores for Laravel 10+, with **constant memory use** regardless of database size.
+> Streaming database → compress → (optional encrypt) → multipart backups **AND** streaming download → decrypt → decompress → restores with rollback on failure for Laravel 10+, with **constant memory use** regardless of database size.
 
 Supports **MySQL**, **PostgreSQL**, **SQLite**, and **custom drivers** via the extensible `DumperFactory` — for **backup**. **Restore supports all three**; see the [support matrix](#supported-databases) below.
 
 **Backup**: The dump process is piped to a compressor (auto-detected: pigz/gzip) which is optionally encrypted, then streamed directly into S3 multipart uploads, SFTP chunked uploads, or local disk. No database-sized temporary file is ever created: the pipeline holds at most one multipart part (default 32 MB) in a bounded `php://temp` buffer, which itself spills to disk past 2 MB. So a 300 GB database and a 3 GB database use roughly the same amount of memory, and roughly the same small, bounded amount of scratch disk space — see [Temporary Disk Usage](#temporary-disk-usage) for exact thresholds.
 
-**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into a database transaction. Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. Restore picks a parser and restorer from the backup's recorded dump tool: `mysqldump`, plain-format `pg_dump` and `sqlite3 .dump` backups are supported, restoring into a connection of the same engine. A backup whose engine has no restore driver, or doesn't match the target connection, is rejected before anything is downloaded.
+**Restore**: Backup files are downloaded as a stream from S3, SFTP, or local disk, decrypted (if encrypted), decompressed on the fly, and parsed to restore either full databases or specific tables directly into the target database, with rollback on failure (see [Rollback by engine](#rollback-by-engine)). Each requested table is captured in its own bounded `php://temp` buffer while it's extracted from the dump, so restore disk usage is bounded per table rather than never touching disk — a restore of one very large table can still spill that table's full size to disk. SFTP-sourced restores additionally spool the whole backup file to a temporary stream before parsing begins (a `phpseclib` limitation). See [Temporary Disk Usage](#temporary-disk-usage) for details. Restore picks a parser and restorer from the backup's recorded dump tool: `mysqldump`, plain-format `pg_dump` and `sqlite3 .dump` backups are supported, restoring into a connection of the same engine. A backup whose engine has no restore driver, or doesn't match the target connection, is rejected before anything is downloaded.
 
 This package is the productised form of the proof-of-concept script [`backup.php`](./backup.php).
 
@@ -204,6 +204,18 @@ php artisan backup:reconcile               # recover backups stuck between uploa
 
 > ℹ️ **Same engine only.** `backup:restore` restores `mysqldump`, plain-format `pg_dump` and `sqlite3 .dump` backups into a connection of the same engine. Restoring a backup into a different engine (for example MySQL into PostgreSQL) is rejected before anything is downloaded.
 
+#### Rollback by engine
+
+A failed restore is rolled back, but how depends on the engine. MySQL commits automatically on DDL (`DROP`, `CREATE`, `ALTER`), so a transaction cannot undo a MySQL restore. The MySQL restorer renames each existing table aside to an `_sbr_*` shadow table instead, and renames it back if the restore fails.
+
+| Engine | Rollback mechanism | Notes |
+|---|---|---|
+| MySQL / MariaDB | Shadow tables (`restore.atomic_restore`, on by default) | With `atomic_restore` off there is **no rollback**: tables restored before the failure stay restored, and the failing table can be left dropped or half loaded. Each table goes live as soon as it is restored, so live traffic can see a mix of old and new tables during the restore. |
+| PostgreSQL | Single transaction | `restore.atomic_restore` and `restore.skip_on_error` don't apply. |
+| SQLite | Single transaction | Holds SQLite's write lock for the whole restore. |
+
+For every engine, the whole backup is downloaded, decrypted, decompressed and parsed **before any SQL runs**. A backup that is truncated, tampered with or fails decryption is rejected before the target database is touched.
+
 #### SQLite restore
 
 - **All or nothing, in place.** A full or selective restore drops and recreates the dumped tables inside one transaction. SQLite DDL is transactional, so any failure rolls everything back and leaves the database file as it was. Tables that are not in the dump (including this package's own tables when they share the file) are left alone.
@@ -239,7 +251,7 @@ Encrypted backups are automatically decrypted during restore using the configure
 
 #### Restore error handling
 
-By default a restore is **fail-fast**: any SQL error aborts the whole run, rolls back every table processed so far (see the shadow-table rollback guarantee in [Architecture](#architecture)), and the `Restore` record is marked `failed`. A partially-restored database that looks successful unless you inspect warnings closely is worse than a loud failure.
+By default a restore is **fail-fast**: any SQL error aborts the whole run, rolls back every table processed so far (see [Rollback by engine](#rollback-by-engine); on MySQL this needs `restore.atomic_restore`, which is on by default), and the `Restore` record is marked `failed`. A partially-restored database that looks successful unless you inspect warnings closely is worse than a loud failure.
 
 Set `STREAM_BACKUP_RESTORE_SKIP_ON_ERROR=true` (or `restore.skip_on_error` in the config) to opt into best-effort recovery instead: a statement that fails with one of `restore.skippable_error_codes` (default `[1227]`, the DEFINER/SUPER privilege error) is logged as a warning and the restore continues. A best-effort restore is never reported as indistinguishable from a clean one:
 
@@ -522,9 +534,10 @@ decompressor (pigz -d / gzip -d)
    │ stdout (non-blocking)
    ▼
 SqlDumpParser (extracts requested tables)
-   │
+   │ whole stream parsed before any SQL runs
    ▼
-TableRestorer (runs inside a DB transaction)
+restorer (rolls back on failure — shadow tables for MySQL,
+          one transaction for PostgreSQL and SQLite)
 ```
 
 ### Temporary Disk Usage
