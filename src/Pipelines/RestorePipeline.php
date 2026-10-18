@@ -25,7 +25,7 @@ use Illuminate\Support\Facades\Log;
  * Streaming restore pipeline — the inverse of StreamPipeline.
  *
  *   Download (stream) → decrypt (if encrypted) → decompress (pigz -d)
- *       → SqlDumpParser (line-by-line) → TableRestorer (transaction)
+ *       → dump parser (line-by-line) → restorer (rollback on failure)
  *
  * Key design choices:
  *
@@ -46,8 +46,16 @@ use Illuminate\Support\Facades\Log;
  *    references. There is no intermediate buffer holding the whole
  *    decompressed dump, on disk or in memory.
  *
- * 4. The TableRestorer executes inside a single DB transaction with
- *    FK checks disabled.
+ * 4. No SQL runs until the whole stream has been decrypted, decompressed
+ *    and parsed. A backup that is truncated, tampered with or fails
+ *    decryption therefore fails before the target database is touched.
+ *    Keep this ordering: it is what makes it safe for decryption to hand
+ *    out plaintext before the stream's authentication has been checked.
+ *
+ * 5. The restorer rolls back on failure, per engine: MySQL uses
+ *    rename-aside shadow tables (TableRestorer, see restore.atomic_restore),
+ *    because MySQL commits automatically on DDL; PostgreSQL and SQLite run
+ *    the restore in a single transaction.
  */
 final class RestorePipeline
 {
@@ -132,7 +140,8 @@ final class RestorePipeline
             // stale data from the dump.
             $tableBlocks = $this->excludeTables($tableBlocks);
 
-            // 7. Restore the tables inside a transaction.
+            // 7. Restore the tables. Nothing has touched the database before
+            //    this point. The restorer rolls back on failure.
             if ($onProgress) {
                 $onProgress(RestoreStatus::Importing);
             }

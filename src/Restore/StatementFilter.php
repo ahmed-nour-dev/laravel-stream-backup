@@ -10,20 +10,20 @@ namespace Ahmednour\StreamBackup\Restore;
  *
  * mysqldump emits several statements that are useless — or actively harmful —
  * when a dump is replayed piecemeal (per table) through a single PDO
- * connection inside a managed transaction. This pure, stateless class keeps
+ * connection. This pure, stateless class keeps
  * that policy in one trivially unit-testable place.
  *
  * Skipped statement families:
  *
  *   LOCK TABLES / UNLOCK TABLES
  *     mysqldump wraps every table block in LOCK/UNLOCK. Executing these
- *     during a programmatic restore implicitly commits the active
- *     transaction (breaking atomicity) and locks the PDO connection so no
+ *     during a programmatic restore implicitly commits any open
+ *     transaction and locks the PDO connection so no
  *     table outside the lock list — including the restore's own tracking
  *     table — can be reached until UNLOCK TABLES runs, which may never
  *     happen if the restore fails mid-table. The restore already runs
- *     inside a transaction with FK checks disabled, so the locks are
- *     unnecessary.
+ *     with FK checks disabled and gets its rollback from shadow tables
+ *     (see TableRestorer), so the locks are unnecessary.
  *
  *   Session save/restore statements referencing @OLD_* user variables
  *     mysqldump snapshots the current session state at the start of the
@@ -37,7 +37,7 @@ namespace Ahmednour\StreamBackup\Restore;
  *     can't be set to the value of 'NULL'"). The same NULL problem affects
  *     every @OLD_* pair (SQL_MODE, FOREIGN_KEY_CHECKS, UNIQUE_CHECKS,
  *     SQL_NOTES, CHARACTER_SET_*, COLLATION_CONNECTION). The restore
- *     manages its own session state (FK checks + transaction), so this
+ *     manages its own session state (FK checks), so this
  *     bookkeeping is both useless and dangerous here.
  */
 final class StatementFilter
