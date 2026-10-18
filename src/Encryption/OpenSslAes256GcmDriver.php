@@ -19,10 +19,14 @@ use Ahmednour\StreamBackup\Streams\OpenSslEncryptionStream;
  * chunk counter, key) lives inside OpenSslEncryptionStream so multiple
  * concurrent backups never interfere.
  *
- * Wire format (handled by OpenSslEncryptionStream):
- *   Header:  [0x01 (version byte)][12-byte random base nonce]
+ * Wire format v2 (handled by OpenSslEncryptionStream):
+ *   Header:  [0x02 (version byte)][12-byte random base nonce]
  *   Chunks:  [4-byte BE ciphertext_len][16-byte GCM tag][ciphertext]
- *   EOF:     [4 bytes: 0x00000000]
+ *   Final:   [4 bytes: 0x00000000][16-byte GCM tag over empty plaintext]
+ *   AAD:     version . base nonce . final flag (0x00 data, 0x01 final)
+ *
+ * Backups written in wire format v1 (version byte 0x01, no AAD, bare
+ * 0x00000000 end marker) still decrypt.
  *
  * Per-chunk nonce derivation:
  *   nonce_i = base_nonce XOR pack('N', i) in the last 4 bytes.
@@ -68,7 +72,7 @@ final class OpenSslAes256GcmDriver implements EncryptionDriver, VerifiesMagicByt
 
     public function verifyMagicBytes(string $magic, Backup $backup): void
     {
-        if (strlen($magic) < 1 || $magic[0] !== "\x01") {
+        if (strlen($magic) < 1 || ($magic[0] !== "\x01" && $magic[0] !== "\x02")) {
             throw new \RuntimeException(sprintf(
                 'Backup %s is encrypted with openssl-aes-256-gcm but does not start with the expected version byte; the object is likely corrupt.',
                 $backup->path,

@@ -21,6 +21,9 @@ use Ahmednour\StreamBackup\Exceptions\InvalidBackupException;
  *   [N bytes: sodium ciphertext]
  *   // last chunk uses TAG_FINAL (embedded in ciphertext)
  *
+ * Only an authenticated TAG_FINAL chunk ends the stream: a zero-length
+ * frame is rejected, and so is any byte after the TAG_FINAL chunk.
+ *
  * Memory per iteration: one ciphertext chunk + one same-size plaintext;
  * both are freed at the end of each read() call.
  */
@@ -35,6 +38,9 @@ final class SodiumDecryptionStream implements BackupStream
      */
     private mixed $state = null;
 
+    /** Length of the frame being read, once its length field is consumed. */
+    private ?int $frameLen = null;
+
     /** Raw bytes buffered from the inner stream, not yet consumed as frames. */
     private string $readBuffer = '';
 
@@ -42,6 +48,10 @@ final class SodiumDecryptionStream implements BackupStream
     private string $pending = '';
 
     private bool $headerRead = false;
+
+    /** True once the TAG_FINAL chunk was read; only inner EOF may follow. */
+    private bool $ended      = false;
+
     private bool $eof        = false;
     private bool $closed     = false;
 
@@ -64,6 +74,10 @@ final class SodiumDecryptionStream implements BackupStream
             return $out;
         }
 
+        if ($this->ended) {
+            return $this->expectInnerEof();
+        }
+
         // Read the header on first call and initialise pull state.
         if (! $this->headerRead) {
             $header = $this->readExactly(1 + self::HEADER_LEN);
@@ -84,27 +98,37 @@ final class SodiumDecryptionStream implements BackupStream
             $this->headerRead = true;
         }
 
-        // Read the next frame: [4-byte len][ciphertext]
-        $lenBytes = $this->readExactly(4);
+        // Read the next frame: [4-byte len][ciphertext]. The length is kept
+        // across calls so a short read cannot lose it.
+        if ($this->frameLen === null) {
+            $lenBytes = $this->readExactly(4);
 
-        if ($lenBytes === null) {
-            return '';  // not enough data yet
+            if ($lenBytes === null) {
+                return '';  // not enough data yet
+            }
+
+            /** @var array{N: int} $unpacked */
+            $unpacked       = unpack('N', $lenBytes);
+            $this->frameLen = $unpacked['N'] ?? $unpacked[1];
+
+            // Every secretstream chunk carries ABYTES of tag + MAC, so a
+            // shorter frame (e.g. a forged zero-length "end marker") is invalid.
+            if ($this->frameLen < SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_ABYTES) {
+                throw new InvalidBackupException(sprintf(
+                    'Encrypted backup stream has an invalid %d-byte frame; '
+                    . 'only an authenticated final chunk may end the stream.',
+                    $this->frameLen,
+                ));
+            }
         }
 
-        /** @var array{N: int} $unpacked */
-        $unpacked      = unpack('N', $lenBytes);
-        $ciphertextLen = $unpacked['N'] ?? $unpacked[1];
-
-        if ($ciphertextLen === 0) {
-            $this->eof = true;
-            return null;
-        }
-
-        $ciphertext = $this->readExactly($ciphertextLen);
+        $ciphertext = $this->readExactly($this->frameLen);
 
         if ($ciphertext === null) {
             return '';  // not enough data yet
         }
+
+        $this->frameLen = null;
 
         $result = sodium_crypto_secretstream_xchacha20poly1305_pull($this->state, $ciphertext);
 
@@ -118,11 +142,11 @@ final class SodiumDecryptionStream implements BackupStream
         [$plaintext, $tag] = $result;
 
         if ($tag === SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_FINAL) {
-            $this->eof = true;
+            $this->ended = true;
 
             // The final chunk may contain data (or be empty).
             if ($plaintext === '') {
-                return null;
+                return $this->expectInnerEof();
             }
         }
 
@@ -151,6 +175,30 @@ final class SodiumDecryptionStream implements BackupStream
         sodium_memzero($this->key);
 
         $this->inner->close();
+    }
+
+    /**
+     * After the TAG_FINAL chunk, the inner stream must be exhausted.
+     *
+     * Returns null once it is, '' while no data is available yet
+     * (non-blocking), and throws on any trailing byte.
+     */
+    private function expectInnerEof(): ?string
+    {
+        $chunk = $this->readBuffer !== '' ? $this->readBuffer : $this->inner->read(1);
+
+        if ($chunk === null) {
+            $this->eof = true;
+            return null;
+        }
+
+        if ($chunk === '') {
+            return '';
+        }
+
+        throw new InvalidBackupException(
+            'Encrypted backup stream has trailing bytes after the end of the stream.'
+        );
     }
 
     /**
