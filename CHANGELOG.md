@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.8.0 (2026-10-18)
+
+This is a security release for encrypted backups. OpenSSL backups now use a new wire format, so read the upgrade notes before you deploy. There are no new migrations and no changed config defaults.
+
+**Upgrading from v1.7.2:** upgrade every server that restores backups before you take new backups. Versions v1.7.2 and earlier cannot restore OpenSSL backups written by this version. After v2 backups exist, do not roll the package back past v1.8.0.
+
+### Security fixes
+
+- **OpenSSL backups now authenticate the end of the stream (wire format v2).** In v1, `openssl-aes-256-gcm` backups ended with a bare `0x00000000` marker that was not authenticated. A backup cut at a chunk boundary, with the marker appended, decrypted as a shorter but valid backup. New backups use version byte `0x02` and end with an authenticated empty final frame. Every frame also has the header in its AAD, so changing the version byte back to `0x01` makes every chunk fail. Existing v1 backups still restore. ([#49](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/49), [#50](https://github.com/ahmed-nour-dev/laravel-stream-backup/pull/50))
+- **Sodium backups can only be ended by the `TAG_FINAL` chunk.** `SodiumDecryptionStream` accepted a zero-length frame as the end of the stream, which allowed the same truncation. The decryptor now rejects frames shorter than the 17-byte secretstream overhead. The Sodium format is unchanged, and existing Sodium backups still restore. ([#50](https://github.com/ahmed-nour-dev/laravel-stream-backup/pull/50))
+- **Both decryptors reject bytes after the end of the stream.**
+
+### Fixes
+
+- **A short read in the middle of a frame no longer breaks a valid restore.** If the inner stream returned `''` after the frame length was read (for example `S3DownloadStream` during a network stall), the decryptor lost the length and failed with "ended unexpectedly mid-frame". The frame length is now kept between reads. ([#50](https://github.com/ahmed-nour-dev/laravel-stream-backup/pull/50))
+
+### Upgrade notes for v1.8.0
+
+- This is a one-way format change for OpenSSL. Plan for rolling deploys (some servers still on the old version), package rollbacks, and restoring new backups on older installs. All three fail with `Expected OpenSSL encryption version byte 0x01`.
+- v1 OpenSSL backups written before this version can still be truncated at a chunk boundary without detection. Fixing that would break v1 support.
+- OpenSSL and Sodium backups now both start with `0x02`, so the post-upload magic byte check can't tell them apart. Restore reads the driver from the backup record, so decryption still uses the right driver.
+
+### Contributors
+
+Thanks to [@albertoarena](https://github.com/albertoarena) (Alberto Arena) for reporting the issue and contributing the fix.
+
 ## v1.7.2 (2026-10-13)
 
 This is a bug-fix release for atomic restore on MySQL and MariaDB. There are no new migrations and no changed defaults.
