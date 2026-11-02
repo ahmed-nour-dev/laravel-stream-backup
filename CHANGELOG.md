@@ -2,7 +2,9 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## v1.9.0 (2026-11-02)
+
+This release makes retention cleanup report its failures instead of skipping them silently. There are no new migrations and no changed config defaults. S3 users without `league/flysystem-aws-s3-v3` must install it (see the upgrade notes).
 
 ### Fixes
 
@@ -10,7 +12,7 @@ All notable changes to this project are documented in this file.
 - **A delete that returns `false` is no longer treated as success.** With a `'throw' => false` disk, `BackupCleanupJob` deleted the row and left the remote object untracked. `BackupReconciler::cleanupOrphan()` now also returns `false` and logs in this case. ([#55](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/55))
 - **The pre-flight check catches a missing S3 adapter.** When `destination.driver` is `s3`, `PreflightChecker` now checks that `default_disk` can be built, so the first backup fails with a `composer require league/flysystem-aws-s3-v3` hint. ([#55](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/55))
 
-### Upgrade notes
+### Upgrade notes for v1.9.0
 
 - S3 users: run `composer require league/flysystem-aws-s3-v3 "^3.0"` if it isn't installed. Without it, backups now fail at pre-flight instead of cleanup failing silently. The package lists it under `suggest`.
 
