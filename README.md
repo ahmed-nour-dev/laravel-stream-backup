@@ -69,7 +69,7 @@ While `spatie/laravel-backup` is an excellent and widely used package, it has a 
 
 | Driver | Upload | Download (Restore) | Notes |
 |---|---|---|---|
-| **S3** | `S3MultipartUploader` | `S3DownloadDriver` | AWS S3, DigitalOcean Spaces, MinIO, etc. |
+| **S3** | `S3MultipartUploader` | `S3DownloadDriver` | AWS S3, DigitalOcean Spaces, MinIO, etc. Requires `league/flysystem-aws-s3-v3 ^3.0` for retention cleanup |
 | **SFTP** | `SftpChunkedUploader` | `SftpDownloadDriver` | Requires `phpseclib/phpseclib ^3.0`; supports key-based auth |
 | **Local** | `LocalDiskUploader` | `LocalDownloadDriver` | Any local/mounted filesystem |
 
@@ -82,6 +82,14 @@ php artisan migrate
 ```
 
 The unified `stream-backup` tag publishes both the configuration file and database migrations in a single command.
+
+**S3 destinations** also need the Flysystem S3 adapter:
+
+```bash
+composer require league/flysystem-aws-s3-v3 "^3.0"
+```
+
+Uploads use the AWS SDK directly, but retention cleanup deletes old backups through your Laravel disk (`STREAM_BACKUP_DISK`), and Laravel can't build an `s3` disk without this adapter. When the destination driver is `s3`, the backup pre-flight check fails if the disk can't be built.
 
 The service provider is auto-discovered.
 
@@ -316,6 +324,8 @@ All three jobs support configurable frequencies via config or env vars:
 | `reconcile` | `hourly`, `everyMinutes`, `cron` | `hourly` |
 
 Invalid frequency values throw `InvalidConfigException` at boot time so typos surface immediately.
+
+If `BackupCleanupJob` can't delete an expired backup (the disk can't be built, the delete throws, or the disk returns `false`), it keeps the `backups` row so the next run retries it, and logs a `stream-backup: failed to delete expired backup` warning with the backup id, disk and path. Once every tier has been processed, it fires a `BackupCleanupFailed` event (with the list of failures) and throws `CleanupFailedException`, so the run shows up in `failed_jobs` and `backup:cleanup --sync` fails.
 
 Add your own `backup:all` cadence to your app's scheduler.
 

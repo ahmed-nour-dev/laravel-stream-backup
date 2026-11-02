@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Fixes
+
+- **Retention cleanup no longer fails silently.** `BackupCleanupJob` swallowed every delete error, so on S3 without `league/flysystem-aws-s3-v3` no expired backup was ever deleted and nothing was logged. Each failed delete is now logged, the row is kept, and the job fires `BackupCleanupFailed` and throws `CleanupFailedException` once all tiers are processed. ([#55](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/55))
+- **A delete that returns `false` is no longer treated as success.** With a `'throw' => false` disk, `BackupCleanupJob` deleted the row and left the remote object untracked. `BackupReconciler::cleanupOrphan()` now also returns `false` and logs in this case. ([#55](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/55))
+- **The pre-flight check catches a missing S3 adapter.** When `destination.driver` is `s3`, `PreflightChecker` now checks that `default_disk` can be built, so the first backup fails with a `composer require league/flysystem-aws-s3-v3` hint. ([#55](https://github.com/ahmed-nour-dev/laravel-stream-backup/issues/55))
+
+### Upgrade notes
+
+- S3 users: run `composer require league/flysystem-aws-s3-v3 "^3.0"` if it isn't installed. Without it, backups now fail at pre-flight instead of cleanup failing silently. The package lists it under `suggest`.
+
 ## v1.8.0 (2026-10-18)
 
 This is a security release for encrypted backups. OpenSSL backups now use a new wire format, so read the upgrade notes before you deploy. There are no new migrations and no changed config defaults.

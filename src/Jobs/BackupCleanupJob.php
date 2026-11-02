@@ -6,6 +6,8 @@ namespace Ahmednour\StreamBackup\Jobs;
 
 use Ahmednour\StreamBackup\Enums\BackupStatus;
 use Ahmednour\StreamBackup\Enums\RetentionTier;
+use Ahmednour\StreamBackup\Events\BackupCleanupFailed;
+use Ahmednour\StreamBackup\Exceptions\CleanupFailedException;
 use Ahmednour\StreamBackup\Models\Backup;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Config\Repository as Config;
@@ -13,10 +15,16 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 /**
  * Deletes completed backups that exceed the per-tier keep limit.
+ *
+ * A backup whose remote object can't be deleted keeps its row, so the next
+ * run retries it. Every such failure is logged; once all tiers have been
+ * processed the job fires BackupCleanupFailed and throws, so the run lands
+ * in failed_jobs instead of passing silently.
  */
 class BackupCleanupJob implements ShouldQueue
 {
@@ -25,8 +33,25 @@ class BackupCleanupJob implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
+    /**
+     * Retrying won't fix a broken disk, and failed deletes are retried on
+     * the next scheduled run anyway.
+     */
+    public int $tries = 1;
+
+    /** @var list<array{backup_id: int|string, disk: ?string, path: string, retention_tier: string, tenant_id: ?string, error: string}> */
+    private array $failures = [];
+
+    private ?\Throwable $firstError = null;
+
+    private int $attempted = 0;
+
     public function handle(Config $config): void
     {
+        $this->failures   = [];
+        $this->firstError = null;
+        $this->attempted  = 0;
+
         foreach (RetentionTier::cases() as $tier) {
             $limit = (int) $config->get("stream-backup.retention.{$tier->value}", 0);
             if ($limit <= 0) {
@@ -43,6 +68,10 @@ class BackupCleanupJob implements ShouldQueue
             foreach ($tenantIds as $tenantId) {
                 $this->pruneTierForTenant($tier, $tenantId, $limit);
             }
+        }
+
+        if ($this->failures !== []) {
+            $this->reportFailures();
         }
     }
 
@@ -62,15 +91,72 @@ class BackupCleanupJob implements ShouldQueue
             ->get();
 
         foreach ($stale as $backup) {
-            try {
-                if (is_string($backup->path) && $backup->path !== '') {
-                    Storage::disk($backup->disk)->delete($backup->path);
+            if (is_string($backup->path) && $backup->path !== '') {
+                $this->attempted++;
+
+                $error = $this->deleteRemote($backup);
+                if ($error !== null) {
+                    $this->recordFailure($backup, $tier, $tenantId, $error);
+                    continue;
                 }
-            } catch (\Throwable) {
-                // leave the DB row in place so a human can investigate
-                continue;
             }
+
             $backup->delete();
         }
+    }
+
+    /**
+     * Returns null on success, or the reason the delete failed. A disk with
+     * `'throw' => false` reports failure by returning false instead of
+     * throwing, so both cases count as a failure.
+     */
+    private function deleteRemote(Backup $backup): ?\Throwable
+    {
+        try {
+            if (Storage::disk($backup->disk)->delete($backup->path) === false) {
+                return new \RuntimeException(sprintf(
+                    "Disk '%s' reported that '%s' could not be deleted.",
+                    (string) $backup->disk,
+                    $backup->path,
+                ));
+            }
+
+            return null;
+        } catch (\Throwable $e) {
+            return $e;
+        }
+    }
+
+    private function recordFailure(Backup $backup, RetentionTier $tier, ?string $tenantId, \Throwable $error): void
+    {
+        $failure = [
+            'backup_id'      => $backup->id,
+            'disk'           => $backup->disk,
+            'path'           => $backup->path,
+            'retention_tier' => $tier->value,
+            'tenant_id'      => $tenantId,
+            'error'          => $error->getMessage(),
+        ];
+
+        Log::warning('stream-backup: failed to delete expired backup', $failure);
+
+        $this->failures[] = $failure;
+        $this->firstError ??= $error;
+    }
+
+    private function reportFailures(): void
+    {
+        event(new BackupCleanupFailed($this->failures));
+
+        throw new CleanupFailedException(
+            sprintf(
+                'Retention cleanup could not delete %d of %d expired backup(s); their rows were kept. First error: %s',
+                count($this->failures),
+                $this->attempted,
+                $this->failures[0]['error'],
+            ),
+            0,
+            $this->firstError,
+        );
     }
 }
