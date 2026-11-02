@@ -151,18 +151,24 @@ final class BackupReconciler
         }
 
         try {
-            Storage::disk($backup->disk)->delete($backup->path);
+            // A disk with `'throw' => false` returns false instead of throwing.
+            if (Storage::disk($backup->disk)->delete($backup->path) !== false) {
+                return true;
+            }
 
-            return true;
+            $error = 'the disk reported that the object could not be deleted';
         } catch (\Throwable $e) {
-            Log::warning('stream-backup: failed to delete orphaned remote object', [
-                'backup_id' => $backup->id,
-                'path'      => $backup->path,
-                'error'     => $e->getMessage(),
-            ]);
-
-            return false;
+            $error = $e->getMessage();
         }
+
+        Log::warning('stream-backup: failed to delete orphaned remote object', [
+            'backup_id' => $backup->id,
+            'disk'      => $backup->disk,
+            'path'      => $backup->path,
+            'error'     => $error,
+        ]);
+
+        return false;
     }
 
     /**

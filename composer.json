@@ -39,8 +39,12 @@
     },
     "require-dev": {
         "illuminate/contracts": "10.*",
+        "league/flysystem-aws-s3-v3": "^3.0",
         "orchestra/testbench": "8.*",
         "phpunit/phpunit": "^10.0 || ^11.0 || ^12.0"
+    },
+    "suggest": {
+        "league/flysystem-aws-s3-v3": "Required for retention cleanup (backup:cleanup) on S3 destinations (^3.0)."
     },
     "autoload": {
         "psr-4": {
